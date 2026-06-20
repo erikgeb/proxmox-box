@@ -4,13 +4,9 @@
   gather_facts: no
   
   tasks:
-    - name: Check for target_host parameter
-      ansible.builtin.debug:
-        msg: "No target_host specified. Exiting playbook gracefully."
-      when: target_host is undefined
-
-    - name: End play gracefully if target_host is missing
-      ansible.builtin.meta: end_play
+    - name: Ensure target_host parameter is provided
+      ansible.builtin.fail:
+        msg: "No target_host specified. Please pass it via '-e target_host=YOUR_IP'."
       when: target_host is undefined
 
 - name: Bootstrap and Create Dedicated Ansible Service Account
@@ -64,7 +60,7 @@
       ansible.builtin.raw: |
         apt-get clean
         apt-get update -y
-        apt-get install -y python3 python3-pip python3-proxmoxer sudo
+        apt-get install -y python3 python3-pip python3-proxmoxer python3-requests sudo
       changed_when: true
 
     - name: Gather facts to verify Python is working
@@ -89,6 +85,8 @@
       ansible.builtin.copy:
         content: "{{ automation_user }} ALL=(ALL) NOPASSWD:ALL"
         dest: "/etc/sudoers.d/{{ automation_user }}"
+        owner: root
+        group: root
         mode: '0440'
         validate: '/usr/sbin/visudo -cf %s'
 
