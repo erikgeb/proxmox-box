@@ -1,0 +1,61 @@
+---
+- name: Provision Proxmox API Account for OpenTofu
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    pve_api_user: "automation"
+    pve_api_realm: "pve"
+    pve_token_name: "open-tofu"
+    pve_custom_role: "CustomAutomation"
+    full_user: "{{ pve_api_user }}@{{ pve_api_realm }}"
+
+  tasks:
+    - name: Create Custom Minimal Automation Role
+      ansible.builtin.command:
+        cmd: "pveum role add {{ pve_custom_role }} -privs 'VM.Allocate VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Cloudinit VM.PowerMgmt Datastore.AllocateSpace Datastore.Audit Sys.Audit'"
+      register: role_create
+      failed_when: 
+        - role_create.rc != 0
+        - "'already exists' not in role_create.stderr"
+      changed_when: role_create.rc == 0
+
+    - name: Create Proxmox API User (PVE Realm)
+      ansible.builtin.command:
+        cmd: "pveum user add {{ full_user }} -comment 'Dedicated Service Account for OpenTofu and Ansible API'"
+      register: user_create
+      failed_when: 
+        - user_create.rc != 0
+        - "'already exists' not in user_create.stderr"
+      changed_when: user_create.rc == 0
+
+    - name: Configure ACL permissions for API user
+      ansible.builtin.command:
+        cmd: "pveum acl modify / -user {{ full_user }} -role {{ pve_custom_role }}"
+      register: acl_create
+      changed_when: acl_create.rc == 0
+
+    - name: Generate API Token for OpenTofu with Privilege Separation
+      ansible.builtin.command:
+        # Using output-format json allows us to cleanly extract the secret
+        cmd: "pveum user token add {{ full_user }} {{ pve_token_name }} --privsep 1 --output-format json"
+      register: token_create
+      failed_when: 
+        - token_create.rc != 0
+        - "'already exists' not in token_create.stderr"
+      changed_when: token_create.rc == 0
+
+    - name: Extract Token Secret (If newly created)
+      ansible.builtin.set_fact:
+        token_secret: "{{ (token_create.stdout | from_json).value }}"
+      when: token_create.changed
+
+    - name: Display OpenTofu Credentials
+      ansible.builtin.debug:
+        msg: 
+          - "--- SAVE THESE DETAILS FOR OPENTOFU IN secrets.auto.tfvars ---"
+          - "Token ID: {{ full_user }}!{{ pve_token_name }}"
+          - "Secret:   {{ token_secret }}"
+      when: token_create.changed
