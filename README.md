@@ -38,4 +38,15 @@ cp tofu.tfvars.example tofu.tfvars
 # Provision docker host
 tofu apply
 
+# TODO: Add ansible script to deploy ansible/resources/docker-compose.yml to docker host and apply it
+
+# TODO: Add support to generate let's encrypt certificate with auto renew
+
+# TODO: Configure VaultWarden host
+
+# TODO: Validate ansible/unlock-storage.yaml after reboot
+
+# TODO: Wrap up
+
+
 ```

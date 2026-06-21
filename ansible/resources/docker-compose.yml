@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:release
+    volumes:
+      - /mnt/storage/immich_data:/usr/src/app/upload
+    devices:
+      - /dev/dri:/dev/dri # Intel QuickSync video transcoding
+    ports:
+      - "2283:2283"
+    restart: always
+
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    image: ghcr.io/immich-app/immich-machine-learning:release-openvino
+    devices:
+      - /dev/dri:/dev/dri # Intel iGPU AI facial recognition acceleration
+    restart: always
+
+  syncthing:
+    image: lscr.io/linuxserver/syncthing:latest
+    container_name: syncthing
+    volumes:
+      - /mnt/storage/syncthing_data:/config
+    ports:
+      - "8384:8384" # Admin GUI Port
+      - "22000:22000/tcp"
+    restart: always
+
