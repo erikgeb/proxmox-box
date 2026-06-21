@@ -94,7 +94,7 @@
         path: "{{ mount_path }}"
         src: "/dev/mapper/{{ mapper_name }}"
         fstype: ext4
-        opts: defaults,noauto
+        opts: defaults
         boot: false
         state: mounted
 
