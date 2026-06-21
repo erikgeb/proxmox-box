@@ -21,5 +21,7 @@ ansible-playbook ansible/bootstrap/harden_and_provision_api_user.yaml
 cp secrets.auto.tfvars.example secrets.auto.tfvars
 # edit secrets.auto.tfvars and add the newly created secret
 
+# No longer show message about subscriptions - your browser cache may prevent seeing the change at first
+ansible-playbook ansible/bootstrap/remove_nag_msg.yaml
 
 ```

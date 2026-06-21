@@ -1,0 +1,33 @@
+---
+- name: Proxmox Post-Install Configuration
+  hosts: proxmox
+  become: yes
+  tasks:
+    - name: Disable the "No Valid Subscription" nag screen
+      ansible.builtin.replace:
+        path: /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+        regexp: "data\\.status\\.toLowerCase\\(\\)\\ !==\\ 'active'"
+        replace: "false"
+        backup: yes
+      notify: Restart Proxmox Web UI
+
+    - name: Create APT hook to persist nag removal across future Proxmox updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-pve-no-nag
+        content: |
+          DPkg::Post-Invoke { "sed -i 's/data.status.toLowerCase() !== \\x27active\\x27/false/g' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js || true"; };
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+
+  handlers:
+    - name: Restart Proxmox Web UI
+      ansible.builtin.systemd:
+        name: pveproxy
+        state: restarted
