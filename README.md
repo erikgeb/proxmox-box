@@ -1,7 +1,7 @@
 # Requirements
 
 - ansible
-- 
+- OpenTofu
 
 Run `ansible-galaxy collection install -r requirements.yaml`
 
@@ -26,4 +26,16 @@ ansible-playbook ansible/bootstrap/remove_nag_msg.yaml
 
 # Warning: this will wipe the targeted disk
 ansible-playbook ansible/bootstrap/setup_encrypted_disks.yaml -e "target_disk=/dev/sdX"
+
+# Install open tofu and then initialize it in the project directory
+tofu init
+
+# Prepare variables for tofu
+cp tofu.tfvars.example tofu.tfvars
+# Edit file according to your configuration
+
+## Pending confirmation
+# Provision docker host
+tofu apply
+
 ```
