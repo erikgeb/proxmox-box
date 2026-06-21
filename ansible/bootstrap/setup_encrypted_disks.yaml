@@ -1,0 +1,120 @@
+---
+- name: Initial Bare-Metal LUKS2 Drive Formatting
+  hosts: proxmox
+  gather_facts: yes
+
+  # Fail early if the user forgets to provide the target_disk
+  pre_tasks:
+    - name: Ensure target_disk parameter is provided
+      ansible.builtin.fail:
+        msg: "CRITICAL: 'target_disk' variable is missing. Run with '-e target_disk=/dev/sdX'."
+      when: target_disk is undefined
+
+    - name: Confirm target disk exists
+      ansible.builtin.stat:
+        path: "{{ target_disk }}"
+      register: disk_check
+
+    - name: Fail if target disk does not exist
+      ansible.builtin.fail:
+        msg: "The specified disk {{ target_disk }} was not found on the system."
+      when: not disk_check.stat.exists
+
+  vars_prompt:
+    - name: master_encryption_key
+      prompt: "Create a strong Master Passphrase for {{ target_disk }}"
+      private: yes
+      confirm: yes
+
+  vars:
+    # We define the partition based on the user-provided disk
+    target_partition: "{{ target_disk }}1"
+    mapper_name: ssdcrypt_data
+    mount_path: /mnt/pve/secure-storage
+
+  tasks:
+    - name: Install required dependencies on Proxmox host
+      become: yes
+      ansible.builtin.package:
+        name:
+          - cryptsetup
+          - parted
+        state: present
+
+    - name: Wipe all pre-existing partition signatures from the target disk
+      become: yes
+      ansible.builtin.command:
+        cmd: wipefs -a "{{ target_disk }}"
+      changed_when: true
+
+    - name: Create a fresh GPT partition table and a single partition using 100% of the SSD
+      become: yes
+      community.general.parted:
+        device: "{{ target_disk }}"
+        label: gpt
+        number: 1
+        part_start: "0%"
+        part_end: "100%"
+        state: present
+
+    - name: Create LUKS2 Encrypted Partition on the new partition
+      become: yes
+      community.crypto.luks_device:
+        device: "{{ target_partition }}"
+        state: present
+        type: luks2
+        passphrase: "{{ master_encryption_key }}"
+        pbkdf:
+          algorithm: argon2id
+
+    - name: Open the newly created LUKS container
+      become: yes
+      community.crypto.luks_device:
+        device: "{{ target_partition }}"
+        name: "{{ mapper_name }}"
+        state: opened
+        passphrase: "{{ master_encryption_key }}"
+
+    - name: Create ext4 File System inside the encrypted space
+      become: yes
+      community.general.filesystem:
+        fstype: ext4
+        dev: "/dev/mapper/{{ mapper_name }}"
+
+    - name: Create the local Proxmox mount point directory
+      become: yes
+      ansible.builtin.file:
+        path: "{{ mount_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Mount the volume and register in fstab (noauto to protect boot)
+      become: yes
+      ansible.posix.mount: # Or ansible.builtin.mount depending on your Ansible version
+        path: "{{ mount_path }}"
+        src: "/dev/mapper/{{ mapper_name }}"
+        fstype: ext4
+        opts: defaults,noauto
+        boot: false
+        state: mounted
+
+    - name: Create application data directories inside secure storage
+      become: yes
+      ansible.builtin.file:
+        path: "{{ mount_path }}/{{ item }}"
+        state: directory
+        mode: "0775"
+      loop:
+        - "immich_data"
+        - "syncthing_data"
+        - "vaultwarden_data"
+
+    - name: Register the directory as Proxmox Storage (if not already added)
+      become: yes
+      ansible.builtin.command:
+        cmd: pvesm add dir secure-storage --path "{{ mount_path }}" --content images,rootdir,backup
+      register: pvesm_add
+      failed_when:
+        - pvesm_add.rc != 0
+        - "'storage ID' not in pvesm_add.stderr" # Ignore error if it already exists
+      changed_when: pvesm_add.rc == 0
