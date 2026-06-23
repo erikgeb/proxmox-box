@@ -66,11 +66,32 @@ ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
 # Check issuance/renewal: pct exec 100 -- docker compose -f /opt/docker-stack/docker-compose.yml logs caddy
 #
 
-# TODO: Configure VaultWarden host
+# Provision the VaultWarden LXC (id 101) — its own trust zone, isolated from the
+# media stack. Unprivileged, NO nesting, NO Docker; rootfs on local-lvm; only the
+# vaultwarden_data subdir of the encrypted volume is bind-mounted in. Requires the
+# encrypted storage mounted first (run unlock_storage.yaml).
+ansible-playbook ansible/bootstrap/06_provision_vaultwarden_lxc.yaml
 
-# TODO: Validate ansible/unlock-storage.yaml after reboot
+# Deploy VaultWarden as a NATIVE binary into LXC 101. Extracts the binary +
+# web-vault from the pinned official vaultwarden/server image using the Docker
+# engine in LXC 100 (so 100 must be up — run 05 first), installs the runtime
+# libs, writes /etc/vaultwarden/vaultwarden.env (DOMAIN derived from caddy.env's
+# BASE_DOMAIN; signups disabled), generates a strong /admin token ON FIRST RUN
+# (prints it ONCE — save it), and starts the hardened systemd service.
+ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 
-# TODO: Wrap up
+# The @vault block in caddy/Caddyfile (vault.<base-domain> -> 192.168.0.54:8000)
+# is already enabled, so a fresh `05` run serves it. If you deployed Caddy before
+# enabling it, re-run 05 to push the updated Caddyfile, then reload Caddy:
+#   ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
+#   pct exec 100 -- docker compose -f /opt/docker-stack/docker-compose.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# Prerequisite (manual, like the other hostnames): make vault.<base-domain>
+# resolve to the docker/Caddy LXC's IP (192.168.0.53 by default) on your LAN.
+#
+# Then browse to https://vault.<base-domain>. Signups are disabled, so create the
+# owner account from the /admin panel (https://vault.<base-domain>/admin) using
+# the printed ADMIN_TOKEN -> User invitations.
 
 
 ```

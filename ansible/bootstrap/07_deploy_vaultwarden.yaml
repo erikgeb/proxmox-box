@@ -1,0 +1,349 @@
+---
+- name: Deploy the native VaultWarden binary into the VaultWarden LXC
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Must match 06_provision_vaultwarden_lxc.yaml / unlock_storage.yaml (these
+    # magic values are duplicated, not shared — keep them in sync).
+    container_id: 101
+    # The Docker LXC — used only at DEPLOY TIME to extract the binary from the
+    # official image (101 has no Docker). Not a runtime dependency.
+    docker_container_id: 100
+    secure_storage_path: /mnt/pve/secure-storage
+    data_subdir: vaultwarden_data
+    # DATA_FOLDER inside the container (the bind mount onto the encrypted volume).
+    data_folder: /var/lib/vaultwarden
+    rocket_port: 8000
+    # Pin a specific VaultWarden version (never 'latest') so updates are a
+    # deliberate, reviewable change. Bumping this re-extracts on the next run.
+    vaultwarden_version: "1.36.0"
+    vaultwarden_image: "vaultwarden/server:{{ vaultwarden_version }}"
+    # Use the debian-based image (glibc), NOT the alpine/musl tag — the binary is
+    # then dynamically linked against the libs we install below.
+    bin_path: /usr/local/bin/vaultwarden
+    share_dir: /usr/local/share/vaultwarden
+    env_dir: /etc/vaultwarden
+    env_file: /etc/vaultwarden/vaultwarden.env
+    # Source files on the Ansible controller (ansible/resources/).
+    resources_dir: "{{ playbook_dir }}/../resources"
+
+  tasks:
+    # --- Phase 1: guards -----------------------------------------------------
+    # DATA_FOLDER is bind-mounted from /mnt/pve/secure-storage/vaultwarden_data.
+    # If the encrypted volume is not mounted, that path is an empty dir on the
+    # unencrypted root disk and the vault DB would init there in the clear.
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first so the vault data lives on the encrypted volume, not the root disk."
+      when: secure_mount_check.rc != 0
+
+    - name: Check the VaultWarden LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the VaultWarden LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 06_provision_vaultwarden_lxc.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the VaultWarden LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    # The extraction step (Phase 2) shells into the Docker LXC and uses its Docker
+    # engine. That LXC must be up with Docker installed (run 05 first).
+    - name: Check the Docker LXC status
+      ansible.builtin.command: "pct status {{ docker_container_id }}"
+      register: docker_ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC is not running
+      ansible.builtin.fail:
+        msg: "Container {{ docker_container_id }} is not running. It is needed to extract the VaultWarden binary from the official image — run unlock_storage.yaml / 05_deploy_docker_stack.yaml first."
+      when: "'status: running' not in docker_ct_status.stdout"
+
+    - name: Check whether Docker is available in the Docker LXC
+      ansible.builtin.command: "pct exec {{ docker_container_id }} -- docker --version"
+      register: docker_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if Docker is not installed in the Docker LXC
+      ansible.builtin.fail:
+        msg: "Docker is not installed in container {{ docker_container_id }}. Run 05_deploy_docker_stack.yaml first (it installs Docker, which we use to extract the VaultWarden binary)."
+      when: docker_probe.rc != 0
+
+    # --- Phase 2: extract binary + web-vault from the official image ---------
+    # Extraction is version-gated: skip entirely when the installed VERSION stamp
+    # already matches the pinned tag, so re-runs are no-ops and there is never a
+    # surprise upgrade.
+    - name: Read the installed VaultWarden version (if any)
+      ansible.builtin.command: "pct exec {{ container_id }} -- cat {{ share_dir }}/VERSION"
+      register: vw_version_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether (re-)extraction is needed
+      ansible.builtin.set_fact:
+        extract_needed: "{{ (vw_version_probe.rc != 0) or (vw_version_probe.stdout | trim != vaultwarden_version) }}"
+
+    # Pull the official image and copy the binary + web-vault out of a throwaway
+    # container. The web-vault is tarred so the whole directory transfers as one
+    # file. Binary and web-vault come from the SAME image, so their versions match.
+    - name: Extract the VaultWarden binary and web-vault inside the Docker LXC
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ docker_container_id }} -- bash -c '
+          set -euo pipefail;
+          docker rm -f vw-extract >/dev/null 2>&1 || true;
+          docker create --name vw-extract {{ vaultwarden_image }} >/dev/null;
+          docker cp vw-extract:/vaultwarden /tmp/vaultwarden;
+          docker cp vw-extract:/web-vault /tmp/web-vault;
+          tar czf /tmp/web-vault.tgz -C /tmp web-vault;
+          rm -rf /tmp/web-vault;
+          docker rm -f vw-extract >/dev/null
+          '
+      when: extract_needed
+      register: vw_extract
+      changed_when: vw_extract.rc == 0
+
+    # pct pull/push run on the Proxmox host, so /tmp here is the host's /tmp (the
+    # transfer hop between the two containers).
+    - name: Pull the binary from the Docker LXC to the host
+      ansible.builtin.command: "pct pull {{ docker_container_id }} /tmp/vaultwarden /tmp/vw-vaultwarden --perms 0755"
+      when: extract_needed
+      register: pull_bin
+      changed_when: pull_bin.rc == 0
+
+    - name: Pull the web-vault archive from the Docker LXC to the host
+      ansible.builtin.command: "pct pull {{ docker_container_id }} /tmp/web-vault.tgz /tmp/vw-web-vault.tgz"
+      when: extract_needed
+      register: pull_web
+      changed_when: pull_web.rc == 0
+
+    # Source is already on the host (pulled from LXC 100 above), so no staging
+    # needed — but still verify the file landed in the container.
+    - name: Push the binary into the VaultWarden LXC (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/vw-vaultwarden {{ bin_path }} --perms 0755
+          && pct exec {{ container_id }} -- test -f {{ bin_path }}'
+      when: extract_needed
+      register: push_bin
+      changed_when: push_bin.rc == 0
+
+    - name: Push the web-vault archive into the VaultWarden LXC (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/vw-web-vault.tgz /tmp/web-vault.tgz
+          && pct exec {{ container_id }} -- test -f /tmp/web-vault.tgz'
+      when: extract_needed
+      register: push_web
+      changed_when: push_web.rc == 0
+
+    - name: Unpack the web-vault and stamp the installed version (in the container)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          mkdir -p {{ share_dir }};
+          rm -rf {{ share_dir }}/web-vault;
+          tar xzf /tmp/web-vault.tgz -C {{ share_dir }};
+          rm -f /tmp/web-vault.tgz;
+          echo {{ vaultwarden_version }} > {{ share_dir }}/VERSION
+          '
+      when: extract_needed
+      register: vw_unpack
+      changed_when: vw_unpack.rc == 0
+
+    - name: Clean up transfer artifacts (host + Docker LXC)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c '
+          rm -f /tmp/vw-vaultwarden /tmp/vw-web-vault.tgz;
+          pct exec {{ docker_container_id }} -- rm -f /tmp/vaultwarden /tmp/web-vault.tgz
+          '
+      when: extract_needed
+      changed_when: false
+      failed_when: false
+
+    # --- Phase 3: runtime libraries + service user --------------------------
+    # The official multi-DB binary dynamically links the postgres/mariadb client
+    # libs and openssl even when we use the bundled SQLite, so install them plus
+    # the argon2/openssl CLIs used to hash the admin token below. If a future tag
+    # needs a different lib, the ldd check that follows surfaces it.
+    - name: Install VaultWarden runtime libraries and token tooling in the container
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          export DEBIAN_FRONTEND=noninteractive;
+          apt-get update;
+          apt-get install -y ca-certificates libssl3 libpq5 libmariadb3 argon2 openssl iproute2
+          '
+      register: vw_libs
+      changed_when: "'Setting up' in vw_libs.stdout"
+
+    - name: Verify the binary has no unresolved shared libraries
+      ansible.builtin.command: "pct exec {{ container_id }} -- ldd {{ bin_path }}"
+      register: vw_ldd
+      changed_when: false
+      failed_when: "'not found' in vw_ldd.stdout"
+
+    - name: Check whether the vaultwarden service user exists
+      ansible.builtin.command: "pct exec {{ container_id }} -- id vaultwarden"
+      register: vw_user
+      changed_when: false
+      failed_when: false
+
+    # uid/gid 1000 must match the host chown (101000:101000) done in 06 under the
+    # default unprivileged-LXC id map, so the service can write DATA_FOLDER.
+    - name: Create the vaultwarden service user (uid/gid 1000)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          groupadd --gid 1000 vaultwarden;
+          useradd --system --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin vaultwarden
+          '
+      when: vw_user.rc != 0
+      register: vw_user_create
+      changed_when: vw_user_create.rc == 0
+
+    # --- Phase 4: config env (generate-once for the admin token) -------------
+    # DOMAIN reuses BASE_DOMAIN from caddy.env (the single source of truth for the
+    # base domain) so the vault is reachable at vault.<base-domain> via Caddy.
+    - name: Check that caddy.env exists (provides BASE_DOMAIN)
+      ansible.builtin.stat:
+        path: "{{ resources_dir }}/caddy.env"
+      delegate_to: localhost
+      become: no
+      register: caddy_env_stat
+
+    - name: Fail if caddy.env is missing
+      ansible.builtin.fail:
+        msg: "{{ resources_dir }}/caddy.env not found. It supplies BASE_DOMAIN (the vault is served at vault.<base-domain>). Copy caddy.env.example -> caddy.env and fill it in (see 05_deploy_docker_stack.yaml)."
+      when: not caddy_env_stat.stat.exists
+
+    - name: Read BASE_DOMAIN from caddy.env
+      ansible.builtin.set_fact:
+        base_domain: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*BASE_DOMAIN\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+
+    - name: Fail if BASE_DOMAIN is not set in caddy.env
+      ansible.builtin.fail:
+        msg: "BASE_DOMAIN is empty in {{ resources_dir }}/caddy.env. Set it (e.g. BASE_DOMAIN=home.example.com) so the vault DOMAIN can be derived."
+      when: base_domain | length == 0
+
+    - name: Build the vault DOMAIN
+      ansible.builtin.set_fact:
+        vault_domain: "https://vault.{{ base_domain }}"
+
+    - name: Ensure the vaultwarden config directory exists
+      ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ env_dir }}"
+      changed_when: false
+
+    - name: Check whether the vaultwarden env already exists
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ env_file }}"
+      register: vw_env_check
+      changed_when: false
+      failed_when: false
+
+    # Generate ONCE: a strong random admin token, stored as an Argon2id PHC hash
+    # (vaultwarden's recommended format) so the plaintext is never on disk. The
+    # plaintext is printed once below for the owner to save. systemd EnvironmentFile
+    # takes values literally, so the '$' chars in the hash need no escaping.
+    - name: Generate vaultwarden.env with a strong ADMIN_TOKEN (first deploy only)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          umask 077;
+          token=$(head -c 1024 /dev/urandom | LC_ALL=C tr -dc "A-Za-z0-9" | cut -c1-48);
+          hash=$(printf "%s" "$token" | argon2 "$(openssl rand -base64 32)" -e -id -k 65540 -t 3 -p 4);
+          printf "%s\n"
+          "DATA_FOLDER={{ data_folder }}"
+          "WEB_VAULT_FOLDER={{ share_dir }}/web-vault"
+          "WEB_VAULT_ENABLED=true"
+          "ROCKET_ADDRESS=0.0.0.0"
+          "ROCKET_PORT={{ rocket_port }}"
+          "DOMAIN={{ vault_domain }}"
+          "SIGNUPS_ALLOWED=false"
+          "ADMIN_TOKEN=$hash" > {{ env_file }};
+          chmod 600 {{ env_file }};
+          printf "PLAINTEXT=%s\n" "$token"
+          '
+      when: vw_env_check.rc != 0
+      register: vw_env_generate
+      changed_when: vw_env_generate.rc == 0
+      no_log: true
+
+    - name: Show the generated /admin token (SAVE IT NOW — shown only once)
+      ansible.builtin.debug:
+        msg:
+          - "VaultWarden /admin token (plaintext) — store it in your password manager NOW; it is not recoverable:"
+          - "{{ vw_env_generate.stdout | regex_search('PLAINTEXT=(.+)', '\\1') | first }}"
+      when: vw_env_generate is changed
+
+    # --- Phase 5: systemd service -------------------------------------------
+    # pct push reads its source from the Proxmox host, not the controller — so
+    # stage the unit on the host first, then push from there and verify it
+    # landed in the container.
+    - name: Stage the vaultwarden systemd unit on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/vaultwarden/vaultwarden.service"
+        dest: /tmp/vw-vaultwarden.service
+        mode: "0644"
+
+    - name: Push the vaultwarden systemd unit into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/vw-vaultwarden.service /etc/systemd/system/vaultwarden.service --perms 0644
+          && pct exec {{ container_id }} -- test -f /etc/systemd/system/vaultwarden.service'
+      register: push_unit
+      changed_when: push_unit.rc == 0
+
+    - name: Reload systemd, enable and (re)start VaultWarden
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          systemctl daemon-reload;
+          systemctl enable vaultwarden;
+          systemctl restart vaultwarden
+          '
+      register: vw_svc
+      changed_when: vw_svc.rc == 0
+
+    - name: Wait for VaultWarden to listen on its port
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          for i in $(seq 1 20); do ss -ltn | grep -q ":{{ rocket_port }} " && exit 0; sleep 1; done; exit 1
+          '
+      register: vw_listen
+      changed_when: false
+      failed_when: false
+
+    - name: Report deployment result
+      ansible.builtin.debug:
+        msg:
+          - "VaultWarden {{ vaultwarden_version }} deployed as a native binary in container {{ container_id }} (no Docker, no nesting)."
+          - "Listening on port {{ rocket_port }}: {{ 'yes' if vw_listen.rc == 0 else 'NOT YET — check: pct exec ' ~ container_id ~ ' -- journalctl -u vaultwarden -n 50' }}"
+          - "Next: enable the @vault block in caddy/Caddyfile, re-run 05_deploy_docker_stack.yaml, then reload Caddy:"
+          - "  pct exec {{ docker_container_id }} -- docker compose -f /opt/docker-stack/docker-compose.yml exec caddy caddy reload --config /etc/caddy/Caddyfile"
+          - "Then point LAN DNS for {{ vault_domain }} at the Caddy LXC (192.168.0.53) and browse there."
+          - "Signups are disabled — register the owner account via the /admin panel using the printed ADMIN_TOKEN."

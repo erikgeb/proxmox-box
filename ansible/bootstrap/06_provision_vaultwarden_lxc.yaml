@@ -1,0 +1,117 @@
+---
+- name: Provision the VaultWarden LXC Container
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # VaultWarden lives in its own LXC (different trust zone from the Docker
+    # media stack in 100). It holds the password vault — the highest-value
+    # secret on the box — so it is kept unprivileged with NO nesting (nesting
+    # loosens LXC confinement; the native-binary decision exists precisely to
+    # avoid needing it). Keep these magic values in sync with
+    # 07_deploy_vaultwarden.yaml / unlock_storage.yaml.
+    container_id: 101
+    hostname: vaultwarden
+    ostemplate_name: "debian-13-standard_13.1-2_amd64.tar.zst"
+    ostemplate: "local:vztmpl/{{ ostemplate_name }}"
+    # rootfs lives on the boot disk (local-lvm), NOT the encrypted volume, so
+    # the container's root filesystem is not gated behind the manual LUKS unlock.
+    rootfs_storage: local-lvm
+    rootfs_size: 8
+    cores: 2
+    memory: 1024
+    network_bridge: vmbr0
+    network_prefix: "192.168.0"
+    vaultwarden_ip_suffix: "54"
+    secure_storage_path: /mnt/pve/secure-storage
+    # Only the vaultwarden_data subdir is bind-mounted in — NOT the whole secure
+    # volume — so this container cannot see the immich/syncthing data (trust-zone
+    # isolation). vaultwarden_data is created by 03_setup_encrypted_disks.yaml.
+    data_subdir: vaultwarden_data
+    mount_path: /var/lib/vaultwarden
+    # The in-container service user is pinned to uid/gid 1000 (07 creates it). With
+    # the default unprivileged-LXC id map (container 0 -> host 100000), container
+    # uid 1000 maps to host uid 101000, so the bind-mounted data dir must be owned
+    # by 101000:101000 on the host for the service to write to it.
+    data_host_uid: 101000
+    data_host_gid: 101000
+
+  tasks:
+    # The bind mount must point at the *mounted* encrypted volume. If the volume
+    # is not mounted, /mnt/pve/secure-storage is just an empty dir on the
+    # unencrypted root disk, so refuse to bind it (run 03_setup_encrypted_disks.yaml
+    # / unlock_storage.yaml first).
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run 03_setup_encrypted_disks.yaml / unlock_storage.yaml first so the bind mount uses the encrypted volume, not the root disk."
+      when: secure_mount_check.rc != 0
+
+    # pct create needs the OS template present in `local` storage first; a fresh
+    # host has none. Refresh the catalog and download on-demand (idempotent: skipped
+    # once the template is already in `pveam list`).
+    - name: Refresh the appliance template catalog
+      ansible.builtin.command: pveam update
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the OS template is already downloaded
+      ansible.builtin.command: "pveam list local"
+      register: pveam_list
+      changed_when: false
+
+    - name: Download the Debian OS template
+      ansible.builtin.command: "pveam download local {{ ostemplate_name }}"
+      when: ostemplate_name not in pveam_list.stdout
+      register: tmpl_download
+      changed_when: tmpl_download.rc == 0
+
+    - name: Check whether the container already exists
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Create the VaultWarden LXC container
+      ansible.builtin.command:
+        cmd: >-
+          pct create {{ container_id }} {{ ostemplate }}
+          --hostname {{ hostname }}
+          --cores {{ cores }}
+          --memory {{ memory }}
+          --unprivileged 1
+          --onboot 0
+          --rootfs {{ rootfs_storage }}:{{ rootfs_size }}
+          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ vaultwarden_ip_suffix }}/24,gw={{ network_prefix }}.1
+      when: ct_status.rc != 0
+      register: ct_create
+      changed_when: ct_create.rc == 0
+
+    # mp0 is reconciled on every run (pct set is idempotent in effect) so config
+    # drift in the bind mount is corrected without recreating the container.
+    - name: Ensure the vaultwarden_data bind mount is configured
+      ansible.builtin.command:
+        cmd: "pct set {{ container_id }} --mp0 {{ secure_storage_path }}/{{ data_subdir }},mp={{ mount_path }}"
+      register: ct_mp
+      changed_when: ct_mp.rc == 0
+
+    # Unprivileged-LXC id-shift: the host-root-owned data dir would appear as
+    # 'nobody' (unwritable) inside the container. chown it to the host uid that
+    # the container's uid 1000 maps to, so the vaultwarden service user can write.
+    - name: Ensure the data dir is owned by the container-mapped uid
+      ansible.builtin.file:
+        path: "{{ secure_storage_path }}/{{ data_subdir }}"
+        owner: "{{ data_host_uid }}"
+        group: "{{ data_host_gid }}"
+        state: directory
+
+    - name: Display provisioning result
+      ansible.builtin.debug:
+        msg: "Container {{ container_id }} ({{ hostname }}) provisioned (unprivileged, no nesting). It does not auto-start (onboot=0); unlock_storage.yaml starts it after the LUKS unlock. Deploy VaultWarden with 07_deploy_vaultwarden.yaml."

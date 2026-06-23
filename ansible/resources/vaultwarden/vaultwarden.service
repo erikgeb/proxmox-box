@@ -1,0 +1,45 @@
+# systemd unit for the native VaultWarden binary in LXC 101.
+#
+# Pushed to /etc/systemd/system/vaultwarden.service by 07_deploy_vaultwarden.yaml.
+# The binary + web-vault are extracted from the official vaultwarden/server image
+# (no Docker in this container); all config comes from the EnvironmentFile.
+#
+# DATA_FOLDER (/var/lib/vaultwarden) is the bind mount onto the LUKS-encrypted
+# volume, present only while the container runs — and the container is started
+# only after unlock-storage.yaml mounts the volume, so startup never races the
+# manual LUKS unlock.
+
+[Unit]
+Description=VaultWarden Server (native)
+Documentation=https://github.com/dani-garcia/vaultwarden
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vaultwarden
+Group=vaultwarden
+EnvironmentFile=/etc/vaultwarden/vaultwarden.env
+ExecStart=/usr/local/bin/vaultwarden
+WorkingDirectory=/var/lib/vaultwarden
+Restart=on-failure
+RestartSec=5
+
+# Hardening — this container holds the highest-value secret on the box, so keep
+# the service itself tightly confined on top of the unprivileged LXC.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# DATA_FOLDER is the only path the service may write to.
+ReadWritePaths=/var/lib/vaultwarden
+
+[Install]
+WantedBy=multi-user.target
