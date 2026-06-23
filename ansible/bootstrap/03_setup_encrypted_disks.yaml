@@ -20,6 +20,30 @@
         msg: "The specified disk {{ target_disk }} was not found on the system."
       when: not disk_check.stat.exists
 
+    # Safety: this playbook wipes target_disk unconditionally. Refuse to do so if
+    # the disk (or any partition on it) is currently mounted or has an open
+    # crypt/LVM/RAID holder — that almost certainly means a wrong '-e target_disk='
+    # (e.g. the boot disk, or the already-unlocked secure-storage volume).
+    - name: Check whether any partition of the target disk is mounted
+      ansible.builtin.shell: "lsblk -nro MOUNTPOINT {{ target_disk }} | grep -v '^$' || true"
+      register: disk_mounts
+      changed_when: false
+
+    - name: Check whether the target disk has open crypt/LVM/RAID holders
+      ansible.builtin.shell: "lsblk -nro TYPE {{ target_disk }} | grep -E '^(crypt|lvm|raid)' || true"
+      register: disk_holders
+      changed_when: false
+
+    - name: Fail if the target disk is currently in use
+      ansible.builtin.fail:
+        msg: |
+          Refusing to wipe {{ target_disk }} — it is currently in use.
+          Mounted at: {{ disk_mounts.stdout | default('(none)', true) }}
+          Open holders (crypt/lvm/raid): {{ disk_holders.stdout | default('(none)', true) }}
+          Verify '-e target_disk=' points at the correct, idle disk; unmount and
+          `cryptsetup close` any holder before wiping if this is truly intended.
+      when: (disk_mounts.stdout | trim | length > 0) or (disk_holders.stdout | trim | length > 0)
+
   vars_prompt:
     - name: master_encryption_key
       prompt: "Create a strong Master Passphrase for {{ target_disk }}"
@@ -27,8 +51,9 @@
       confirm: yes
 
   vars:
-    # We define the partition based on the user-provided disk
-    target_partition: "{{ target_disk }}1"
+    # We define the partition based on the user-provided disk.
+    # NVMe/eMMC devices use a 'p' separator (/dev/nvme0n1p1), unlike SATA (/dev/sda1).
+    target_partition: "{{ target_disk }}{{ 'p1' if ('nvme' in target_disk or 'mmcblk' in target_disk) else '1' }}"
     mapper_name: ssdcrypt_data
     mount_path: /mnt/pve/secure-storage
 
@@ -56,6 +81,11 @@
         part_start: "0%"
         part_end: "100%"
         state: present
+
+    - name: Wait for the new partition device node to appear (avoid udev race before LUKS)
+      become: yes
+      ansible.builtin.command: udevadm settle
+      changed_when: false
 
     - name: Create LUKS2 Encrypted Partition on the new partition
       become: yes
@@ -112,7 +142,10 @@
     - name: Register the directory as Proxmox Storage (if not already added)
       become: yes
       ansible.builtin.command:
-        cmd: pvesm add dir secure-storage --path "{{ mount_path }}" --content images,rootdir,backup
+        # --is_mountpoint 1 makes Proxmox refuse to use this storage unless the encrypted
+        # volume is actually mounted, preventing writes to the unencrypted root disk
+        # (e.g. after a reboot, before unlock_storage.yaml has run).
+        cmd: pvesm add dir secure-storage --path "{{ mount_path }}" --content images,rootdir,backup --is_mountpoint 1
       register: pvesm_add
       failed_when:
         - pvesm_add.rc != 0
