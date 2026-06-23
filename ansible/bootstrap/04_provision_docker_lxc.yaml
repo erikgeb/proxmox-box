@@ -1,0 +1,149 @@
+---
+- name: Provision the Docker LXC Container
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    container_id: 100
+    hostname: docker-srv
+    ostemplate_name: "debian-13-standard_13.1-2_amd64.tar.zst"
+    ostemplate: "local:vztmpl/{{ ostemplate_name }}"
+    # rootfs lives on the boot disk (local-lvm), NOT the encrypted volume, so the
+    # container's root filesystem is not gated behind the manual LUKS unlock.
+    rootfs_storage: local-lvm
+    rootfs_size: 20
+    cores: 4
+    memory: 16384
+    network_bridge: vmbr0
+    network_prefix: "192.168.0"
+    docker_host_ip_suffix: "53"
+    secure_storage_path: /mnt/pve/secure-storage
+    mount_path: /mnt/storage
+    gpu_device: /dev/dri/renderD128
+    # The data dirs are created host-root-owned by 03_setup_encrypted_disks.yaml.
+    # Inside this unprivileged LXC (default id map: container 0 -> host 100000)
+    # host uid 0 falls outside the map and appears as 'nobody' — unwritable, and
+    # container-root cannot chown it. Re-own the dirs to the host uid that the
+    # container's root (uid 0) maps to so Docker — and each image's root-stage
+    # entrypoint, which then sub-chowns to its own service uid (e.g. postgres
+    # 999 -> host 100999) — can write. vaultwarden_data is intentionally NOT
+    # listed: 06_provision_vaultwarden_lxc.yaml owns it (uid 1000 -> host 101000).
+    data_host_uid: 100000
+    data_host_gid: 100000
+    data_subdirs:
+      - immich_data
+      - immich_db
+      - syncthing_data
+      - caddy_data
+
+  tasks:
+    # The bind mount must point at the *mounted* encrypted volume. If the volume is
+    # not mounted, /mnt/pve/secure-storage is just an empty dir on the unencrypted
+    # root disk, so refuse to bind it (run 03_setup_encrypted_disks.yaml / unlock_storage.yaml first).
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run 03_setup_encrypted_disks.yaml / unlock_storage.yaml first so the bind mount uses the encrypted volume, not the root disk."
+      when: secure_mount_check.rc != 0
+
+    # pct create needs the OS template present in `local` storage first; a fresh
+    # host has none. Refresh the catalog and download on-demand (idempotent: skipped
+    # once the template is already in `pveam list`).
+    - name: Refresh the appliance template catalog
+      ansible.builtin.command: pveam update
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the OS template is already downloaded
+      ansible.builtin.command: "pveam list local"
+      register: pveam_list
+      changed_when: false
+
+    - name: Download the Debian OS template
+      ansible.builtin.command: "pveam download local {{ ostemplate_name }}"
+      when: ostemplate_name not in pveam_list.stdout
+      register: tmpl_download
+      changed_when: tmpl_download.rc == 0
+
+    - name: Check whether the container already exists
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Create the Docker LXC container
+      ansible.builtin.command:
+        cmd: >-
+          pct create {{ container_id }} {{ ostemplate }}
+          --hostname {{ hostname }}
+          --cores {{ cores }}
+          --memory {{ memory }}
+          --unprivileged 1
+          --features nesting=1
+          --onboot 0
+          --rootfs {{ rootfs_storage }}:{{ rootfs_size }}
+          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ docker_host_ip_suffix }}/24,gw={{ network_prefix }}.1
+      when: ct_status.rc != 0
+      register: ct_create
+      changed_when: ct_create.rc == 0
+
+    # mp0/dev0 are reconciled on every run (pct set is idempotent in effect) so
+    # config drift in the bind mount or GPU passthrough is corrected without recreating.
+    - name: Ensure the secure-storage bind mount is configured
+      ansible.builtin.command:
+        cmd: "pct set {{ container_id }} --mp0 {{ secure_storage_path }},mp={{ mount_path }}"
+      register: ct_mp
+      changed_when: ct_mp.rc == 0
+
+    - name: Check whether the iGPU render device is present on the host
+      ansible.builtin.stat:
+        path: "{{ gpu_device }}"
+      register: gpu_stat
+
+    - name: Ensure the iGPU device passthrough is configured
+      ansible.builtin.command:
+        cmd: "pct set {{ container_id }} --dev0 {{ gpu_device }},uid=1000,gid=1000,mode=0666"
+      when: gpu_stat.stat.exists
+      register: ct_dev
+      changed_when: ct_dev.rc == 0
+
+    - name: Warn if the iGPU device is absent (transcoding/ML fall back to CPU)
+      ansible.builtin.debug:
+        msg: "{{ gpu_device }} not found on the host — skipping GPU passthrough. Immich transcoding and ML will run on CPU."
+      when: not gpu_stat.stat.exists
+
+    # See the data_subdirs comment in vars: re-own the host dirs so the container
+    # can write to the bind mount. We ONLY claim a dir that is still owned by host
+    # root (uid 0) — i.e. one no container service has taken over yet. Once a
+    # service's root-stage entrypoint sub-chowns it to its own uid (e.g. Postgres
+    # PGDATA -> host 100999, syncthing -> host 100911), the dir's uid is no longer
+    # 0, so this skips it. That makes the task safe to re-run on a live stack:
+    # forcing immich_db back to 100000 would otherwise break an initialized
+    # Postgres ("data directory has wrong ownership").
+    - name: Stat the Docker data dirs
+      ansible.builtin.stat:
+        path: "{{ secure_storage_path }}/{{ item }}"
+      loop: "{{ data_subdirs }}"
+      register: data_dir_stat
+
+    - name: Claim ownership of data dirs still owned by host root (pre-first-run only)
+      ansible.builtin.file:
+        path: "{{ item.stat.path }}"
+        owner: "{{ data_host_uid }}"
+        group: "{{ data_host_gid }}"
+        state: directory
+      loop: "{{ data_dir_stat.results }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+      when: item.stat.uid == 0
+
+    - name: Display provisioning result
+      ansible.builtin.debug:
+        msg: "Container {{ container_id }} ({{ hostname }}) provisioned. It does not auto-start (onboot=0); unlock_storage.yaml starts it after the LUKS unlock."

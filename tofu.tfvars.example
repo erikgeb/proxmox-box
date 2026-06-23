@@ -1,4 +1,0 @@
-proxmox_os_template         = "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst"
-network_prefix              = "192.168.1"
-docker_host_ip_suffix       = "53"
-docker_container_id         = 100
