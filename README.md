@@ -34,11 +34,37 @@ ansible-playbook ansible/bootstrap/03_setup_encrypted_disks.yaml -e "target_disk
 #   -e "container_id=100 rootfs_storage=local-lvm docker_host_ip_suffix=53"
 ansible-playbook ansible/bootstrap/04_provision_docker_lxc.yaml
 
+# After every reboot: unlock the encrypted storage and start the dependent containers.
+# Prompts for the LUKS passphrase. Use the same disk you passed to 03_setup_encrypted_disks.yaml.
+ansible-playbook ansible/unlock_storage.yaml -e "target_disk=/dev/sdX"
 
+# Before deploying: set up in-home HTTPS (Caddy reverse proxy + Let's Encrypt).
+# Caddy fronts the media apps and obtains a *.<base-domain> wildcard cert via the
+# ACME DNS-01 challenge (the box has no inbound HTTP — LAN-only) using the OVH DNS
+# provider, and auto-renews it. Copy the example env and fill in the OVH API
+# credentials + your base domain:
+#   cp ansible/resources/caddy.env.example ansible/resources/caddy.env   # then edit (gitignored)
+# Create the OVH credential at https://api.ovh.com/createToken/ with rights
+# GET/POST/PUT/DELETE on /domain/zone/* (so Caddy can write the _acme-challenge TXT records).
+#
+# Prerequisite (manual — depends on your LAN DNS, not automated here): make
+# *.<base-domain> (or at least immich.<base-domain> / syncthing.<base-domain>)
+# resolve to the docker LXC's IP (192.168.0.53 by default) on your LAN — e.g. on
+# the router, a Pi-hole, or a hosts file. DNS-01 itself only needs OVH API access.
 
-# TODO: Add ansible script to deploy ansible/resources/docker-compose.yml to docker host and apply it
+# Deploy the application stack into the docker LXC. Installs Docker CE in the
+# container (if needed), generates resources/.env -> the container's .env with a
+# strong DB_PASSWORD on first run (never rotated after), pushes the Caddy
+# resources (fails if caddy.env is missing), then `docker compose up -d` (builds
+# the custom Caddy image with the OVH DNS module on first run).
+# Requires the encrypted storage to be mounted first (run unlock_storage.yaml),
+# else the bind mount captures an empty dir and Postgres inits on the root disk.
+ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
 
-# TODO: Add support to generate let's encrypt certificate with auto renew
+# Verify HTTPS from a LAN client (once DNS resolves the names to the LXC):
+#   https://immich.<base-domain>  and  https://syncthing.<base-domain>  with a valid Let's Encrypt cert.
+# Check issuance/renewal: pct exec 100 -- docker compose -f /opt/docker-stack/docker-compose.yml logs caddy
+#
 
 # TODO: Configure VaultWarden host
 

@@ -1,0 +1,51 @@
+# Reverse proxy + in-home HTTPS for the LAN services in the Docker LXC (100).
+#
+# A single wildcard cert (*.${BASE_DOMAIN}) is obtained from Let's Encrypt via
+# the ACME DNS-01 challenge (the box has no inbound HTTP, so HTTP-01/TLS-ALPN
+# are impossible) using the OVH DNS provider, and auto-renewed by Caddy.
+#
+# All `{$VAR}` values are read from caddy.env (sibling file, gitignored). The
+# upstream names below are docker-compose *service names*, resolved on the
+# shared compose project network.
+#
+# Prerequisite (manual, out of scope here): the LAN DNS must resolve
+# *.${BASE_DOMAIN} (or at least the hostnames below) to this LXC's IP so
+# clients can reach Caddy. DNS-01 itself only needs OVH API access, not public
+# resolution of the box.
+
+{
+	email {$ACME_EMAIL}
+}
+
+*.{$BASE_DOMAIN} {
+	tls {
+		dns ovh {
+			endpoint {$OVH_ENDPOINT}
+			application_key {$OVH_APPLICATION_KEY}
+			application_secret {$OVH_APPLICATION_SECRET}
+			consumer_key {$OVH_CONSUMER_KEY}
+		}
+	}
+
+	@immich host immich.{$BASE_DOMAIN}
+	handle @immich {
+		reverse_proxy immich-server:2283
+	}
+
+	@syncthing host syncthing.{$BASE_DOMAIN}
+	handle @syncthing {
+		reverse_proxy syncthing:8384
+	}
+
+	# VaultWarden runs in LXC 101 (a separate trust zone), NOT on this compose
+	# network — so it is reached by IP, not service name. WebSocket notifications
+	# are proxied transparently by reverse_proxy.
+	@vault host vault.{$BASE_DOMAIN}
+	handle @vault {
+		reverse_proxy 192.168.0.54:8000
+	}
+
+	handle {
+		respond "Unknown host" 404
+	}
+}

@@ -1,0 +1,87 @@
+---
+- name: Post-Reboot Secure Storage Unlock
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  # Fail early if the user forgets to provide the target_disk
+  pre_tasks:
+    - name: Ensure target_disk parameter is provided
+      ansible.builtin.fail:
+        msg: "CRITICAL: 'target_disk' variable is missing. Run with '-e target_disk=/dev/sdX'."
+      when: target_disk is undefined
+
+  vars_prompt:
+    - name: unlock_passphrase
+      prompt: "Enter the LUKS Master Passphrase to unlock the secure storage"
+      private: yes
+
+  vars:
+    # Derive the partition from the user-provided disk, identically to 03_setup_encrypted_disks.yaml.
+    # NVMe/eMMC devices use a 'p' separator (/dev/nvme0n1p1), unlike SATA (/dev/sda1).
+    target_partition: "{{ target_disk }}{{ 'p1' if ('nvme' in target_disk or 'mmcblk' in target_disk) else '1' }}"
+    mapper_name: ssdcrypt_data
+    mount_path: /mnt/pve/secure-storage
+    docker_container_id: 100
+    vaultwarden_container_id: 101
+
+  tasks:
+    - name: Open the LUKS encrypted container
+      community.crypto.luks_device:
+        device: "{{ target_partition }}"
+        name: "{{ mapper_name }}"
+        state: opened
+        passphrase: "{{ unlock_passphrase }}"
+
+    - name: Mount the secure storage volume
+      ansible.posix.mount:
+        path: "{{ mount_path }}"
+        src: "/dev/mapper/{{ mapper_name }}"
+        fstype: ext4
+        # boot: false adds noauto to the fstab entry on Linux (manual LUKS unlock after
+        # every boot is deliberate). Matches 03_setup_encrypted_disks.yaml's mount style.
+        opts: defaults
+        boot: false
+        state: mounted
+
+    - name: Refresh Proxmox storage status to detect the mount
+      ansible.builtin.command:
+        cmd: pvesm status
+      changed_when: false
+
+    - name: Display Unlock Success Message
+      ansible.builtin.debug:
+        msg: "Secure storage unlocked and successfully mounted to {{ mount_path }}. You may now start your dependent VMs/Containers."
+
+    # Start the dependent containers, but only the ones that actually exist and
+    # are not already running. Early in the lifecycle (or if VaultWarden was never
+    # deployed) container 101 may not exist; an unconditional `pct start` on a
+    # missing — or an already-running — container errors out and fails the play.
+    - name: Check the status of the dependent containers
+      ansible.builtin.command: "pct status {{ item }}"
+      loop:
+        - "{{ docker_container_id }}"
+        - "{{ vaultwarden_container_id }}"
+      register: dependent_ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Start each dependent container that exists and is not already running
+      ansible.builtin.command: "pct start {{ item.item }}"
+      loop: "{{ dependent_ct_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.rc == 0
+        - "'status: running' not in item.stdout"
+      register: dependent_ct_start
+      changed_when: dependent_ct_start.rc == 0
+
+    - name: Report which containers were skipped (missing)
+      ansible.builtin.debug:
+        msg: "Container {{ item.item }} does not exist yet — skipped (provision it with the relevant bootstrap playbook)."
+      loop: "{{ dependent_ct_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0

@@ -136,8 +136,10 @@
         mode: "0775"
       loop:
         - "immich_data"
+        - "immich_db"
         - "syncthing_data"
         - "vaultwarden_data"
+        - "caddy_data"        # Caddy ACME account + cert private keys (kept at rest)
 
     - name: Register the directory as Proxmox Storage (if not already added)
       become: yes

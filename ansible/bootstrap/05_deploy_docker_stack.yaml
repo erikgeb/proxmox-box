@@ -1,0 +1,242 @@
+---
+- name: Deploy the Docker application stack into the Docker LXC
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Must match 04_provision_docker_lxc.yaml / unlock_storage.yaml (these magic
+    # values are duplicated, not shared — keep them in sync).
+    container_id: 100
+    secure_storage_path: /mnt/pve/secure-storage
+    mount_path: /mnt/storage
+    # Working directory *inside* the container for the compose project.
+    compose_dir: /opt/docker-stack
+    # Source files on the Ansible controller (ansible/resources/).
+    resources_dir: "{{ playbook_dir }}/../resources"
+
+  tasks:
+    # --- Phase 1: guards -----------------------------------------------------
+    # The compose stack bind-mounts /mnt/storage (-> /mnt/pve/secure-storage on
+    # the host). If the encrypted volume is not mounted, that path is an empty
+    # dir on the unencrypted root disk and Postgres would init there in the
+    # clear. Refuse to deploy unless the encrypted volume is actually mounted.
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first so the bind mount uses the encrypted volume, not the root disk."
+      when: secure_mount_check.rc != 0
+
+    - name: Check the Docker LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 04_provision_docker_lxc.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the Docker LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    # --- Phase 2: Docker engine inside the LXC -------------------------------
+    # The container is a bare Debian template with nesting enabled; nothing has
+    # installed Docker yet. Install it from Docker's official apt repo, gated on
+    # a probe so re-runs are no-ops.
+    - name: Check whether Docker is already installed in the container
+      ansible.builtin.command: "pct exec {{ container_id }} -- command -v docker"
+      register: docker_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker CE and the compose plugin inside the container
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          export DEBIAN_FRONTEND=noninteractive;
+          apt-get update;
+          apt-get install -y ca-certificates curl;
+          install -m 0755 -d /etc/apt/keyrings;
+          curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc;
+          chmod a+r /etc/apt/keyrings/docker.asc;
+          . /etc/os-release;
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $VERSION_CODENAME stable" > /etc/apt/sources.list.d/docker.list;
+          apt-get update;
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin;
+          systemctl enable --now docker
+          '
+      when: docker_probe.rc != 0
+      register: docker_install
+      changed_when: docker_install.rc == 0
+
+    # --- Phase 3: project files + .env (generate-once) -----------------------
+    - name: Ensure the compose project directory exists in the container
+      ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ compose_dir }}"
+      register: mk_compose_dir
+      changed_when: false
+
+    # pct push runs on the Proxmox host and reads its SOURCE from the *host*
+    # filesystem — but resources_dir is a path on the Ansible controller. Stage
+    # each file onto the host first with ansible.builtin.copy (which runs over
+    # the SSH connection and fails loudly if the controller source is missing),
+    # then pct push from that host path. Each push also verifies the file
+    # actually landed in the container: pct push has been observed to exit 0
+    # even when nothing was transferred, so its own return code is not a
+    # sufficient guard (this is why a missing source surfaced only later, when
+    # something tried to read the file).
+    - name: Stage docker-compose.yml on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/docker-compose.yml"
+        dest: /tmp/docker-stack-compose.yml
+        mode: "0644"
+
+    - name: Push docker-compose.yml into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-compose.yml {{ compose_dir }}/docker-compose.yml
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/docker-compose.yml'
+      register: push_compose
+      changed_when: push_compose.rc == 0
+
+    - name: Stage .env.example on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/.env.example"
+        dest: /tmp/docker-stack-env.example
+        mode: "0644"
+
+    - name: Push .env.example into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-env.example {{ compose_dir }}/.env.example
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/.env.example'
+      register: push_env_example
+      changed_when: push_env_example.rc == 0
+
+    # Postgres bakes the password into its data dir on first init — so the
+    # password must be generated exactly once and then never changed, or auth
+    # breaks. Only create .env when it is absent; leave an existing one alone.
+    - name: Check whether the container already has a .env
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ compose_dir }}/.env"
+      register: env_check
+      changed_when: false
+      failed_when: false
+
+    - name: Generate .env with a strong DB_PASSWORD (first deploy only)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          pw=$(head -c 1024 /dev/urandom | LC_ALL=C tr -dc "A-Za-z0-9" | cut -c1-40);
+          sed "s|^DB_PASSWORD=.*|DB_PASSWORD=$pw|" {{ compose_dir }}/.env.example > {{ compose_dir }}/.env;
+          chmod 600 {{ compose_dir }}/.env
+          '
+      when: env_check.rc != 0
+      register: env_generate
+      changed_when: env_generate.rc == 0
+
+    # --- Phase 3b: Caddy reverse proxy resources -----------------------------
+    # Caddy needs its build context (Dockerfile), its config (Caddyfile, bind-
+    # mounted read-only) and the OVH DNS-01 credentials (caddy.env). caddy.env
+    # is user-supplied and gitignored — refuse to deploy without it so Caddy is
+    # never brought up unable to obtain a cert.
+#    - name: Check that caddy.env exists alongside the resources
+#      ansible.builtin.stat:
+#        path: "{{ resources_dir }}/caddy.env"
+#      register: caddy_env_stat
+
+#    - name: Fail if caddy.env is missing
+#      ansible.builtin.fail:
+#        msg: "{{ resources_dir }}/caddy.env not found. Copy caddy.env.example -> caddy.env and fill in the OVH API credentials + BASE_DOMAIN before deploying."
+#      when: not caddy_env_stat.stat.exists
+
+    - name: Ensure the Caddy build/config directory exists in the container
+      ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ compose_dir }}/caddy"
+      register: mk_caddy_dir
+      changed_when: false
+
+#    - name: Ensure the Caddy data directory exists on the encrypted volume
+#      ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ mount_path }}/caddy_data"
+#      register: mk_caddy_data
+#      changed_when: false
+
+    - name: Stage the Caddy Dockerfile on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/caddy/Dockerfile"
+        dest: /tmp/docker-stack-caddy-Dockerfile
+        mode: "0644"
+
+    - name: Push the Caddy Dockerfile into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-caddy-Dockerfile {{ compose_dir }}/caddy/Dockerfile
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/caddy/Dockerfile'
+      register: push_caddy_dockerfile
+      changed_when: push_caddy_dockerfile.rc == 0
+
+    - name: Stage the Caddyfile on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/caddy/Caddyfile"
+        dest: /tmp/docker-stack-Caddyfile
+        mode: "0644"
+
+    - name: Push the Caddyfile into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-Caddyfile {{ compose_dir }}/caddy/Caddyfile
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/caddy/Caddyfile'
+      register: push_caddyfile
+      changed_when: push_caddyfile.rc == 0
+
+    # caddy.env holds the OVH API secret — stage it mode 600, push with
+    # restrictive perms, then remove the host-side staging copy so the secret
+    # does not linger in /tmp.
+    - name: Stage caddy.env on the Proxmox host (mode 600)
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/caddy.env"
+        dest: /tmp/docker-stack-caddy.env
+        mode: "0600"
+
+    - name: Push caddy.env into the container (mode 600, and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-caddy.env {{ compose_dir }}/caddy.env --perms 0600
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/caddy.env'
+      register: push_caddy_env
+      changed_when: push_caddy_env.rc == 0
+
+    - name: Remove the host-side caddy.env staging copy
+      ansible.builtin.file:
+        path: /tmp/docker-stack-caddy.env
+        state: absent
+
+    # --- Phase 4: deploy -----------------------------------------------------
+    - name: Bring up the compose stack
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose up -d'"
+      register: compose_up
+      changed_when: >-
+        ('Started' in compose_up.stderr) or ('Created' in compose_up.stderr)
+        or ('Recreate' in compose_up.stderr) or ('Pull' in compose_up.stderr)
+
+    - name: Report deployment result
+      ansible.builtin.debug:
+        msg:
+          - "Compose stack deployed in container {{ container_id }} (Caddy image built on first run)."
+          - "Via Caddy (HTTPS, once LAN DNS points the names at this LXC):"
+          - "  Immich:    https://immich.<base-domain>"
+          - "  Syncthing: https://syncthing.<base-domain>"
+          - "Direct (HTTP fallback): http://<container-ip>:2283 (Immich), :8384 (Syncthing)."
+          - "Caddy obtains a *.<base-domain> wildcard cert via OVH DNS-01; check 'docker compose logs caddy' for issuance."
+          - "DB password is stored only in {{ compose_dir }}/.env inside the container (generated once, never rotated here)."

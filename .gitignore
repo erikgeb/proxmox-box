@@ -1,3 +1,8 @@
 inventory.ini
 .DS_Store
 
+# Docker compose secrets (DB password). Commit only .env.example.
+ansible/resources/.env
+
+# Caddy / OVH DNS-01 API credentials. Commit only caddy.env.example.
+ansible/resources/caddy.env
