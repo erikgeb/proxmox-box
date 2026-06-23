@@ -1,0 +1,64 @@
+---
+# One-time host hardening: keep Debian SECURITY patches flowing automatically
+# between the deliberate manual full-upgrade runs (ansible/update_proxmox.yaml).
+#
+# Scope is intentionally narrow:
+#   * Debian-Security origin ONLY — PVE/Ceph package upgrades can be disruptive
+#     (kernel, cluster stack) and are left to the manual update_proxmox.yaml.
+#   * NO automatic reboot — the box is owner-operated, and a reboot also requires
+#     a manual LUKS unlock (unlock_storage.yaml) afterwards, so it must stay manual.
+#
+# Usage:
+#   ansible-playbook ansible/bootstrap/08_enable_unattended_upgrades.yaml
+- name: Enable Debian unattended security upgrades on the Proxmox host
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  tasks:
+    - name: Install unattended-upgrades
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+        update_cache: yes
+
+    # Defining Origins-Pattern here (drop-in 52, loaded after the packaged 50)
+    # REPLACES the default allow-list, narrowing it to the security origin only.
+    - name: Restrict unattended upgrades to the Debian security origin (no reboot)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/52unattended-upgrades-local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          // Managed by ansible/bootstrap/08_enable_unattended_upgrades.yaml — do not edit by hand.
+          // Security patches only; PVE/Ceph upgrades are handled manually by update_proxmox.yaml.
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+          };
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+    - name: Enable the periodic apt update + unattended-upgrade run
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Ensure the apt-daily-upgrade timer is enabled and running
+      ansible.builtin.systemd:
+        name: apt-daily-upgrade.timer
+        enabled: yes
+        state: started
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Unattended SECURITY upgrades enabled (Debian-Security origin only, no auto-reboot)."
+          - "Verify: sudo unattended-upgrade --dry-run --debug  and  systemctl status apt-daily-upgrade.timer"
+          - "Run ansible/update_proxmox.yaml for full host + guest dist-upgrades (incl. PVE)."

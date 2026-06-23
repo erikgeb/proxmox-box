@@ -1,0 +1,126 @@
+---
+# Recurrent maintenance: upgrade the Docker application stack in LXC 100 (Immich
+# + machine-learning, Postgres, Valkey, Syncthing, Caddy). Self-contained, in
+# ansible/ root like unlock_storage.yaml / update_vaultwarden.yaml.
+#
+# Two upgrade levers, because the version pins live in two places:
+#   * Image tags pinned directly in ansible/resources/docker-compose.yml
+#     (postgres, valkey, syncthing, caddy): edit the tag there, then run this
+#     playbook — it re-pushes the compose file and pulls.
+#   * Immich: pinned via IMMICH_VERSION, which lives in the generate-once .env.
+#     05_deploy_docker_stack.yaml writes .env exactly once and never rewrites it
+#     (the DB password must never change), so editing IMMICH_VERSION in the repo
+#     .env.example does NOT propagate. Pass -e immich_version=vX.Y.Z here to
+#     rewrite the IMMICH_VERSION line in the LIVE .env in place.
+#
+# VaultWarden is a native binary in LXC 101 and is upgraded by its own playbook
+# (ansible/update_vaultwarden.yaml), not here.
+#
+# Usage:
+#   ansible-playbook ansible/update_docker_stack.yaml                          # pull repo-pinned tags + recreate
+#   ansible-playbook ansible/update_docker_stack.yaml -e immich_version=v2.8.0 # also bump Immich
+#
+# Requires the encrypted storage mounted (run unlock_storage.yaml first).
+- name: Update the Docker application stack in LXC 100
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep in sync with 04/05_*docker*.yaml (duplicated, not shared).
+    container_id: 100
+    secure_storage_path: /mnt/pve/secure-storage
+    compose_dir: /opt/docker-stack
+    # This playbook lives in ansible/ root, so resources is alongside it.
+    resources_dir: "{{ playbook_dir }}/resources"
+    # immich_version is optional; supply with -e immich_version=vX.Y.Z to bump Immich.
+
+  tasks:
+    # --- Guards (same preconditions as 05) -----------------------------------
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first."
+      when: secure_mount_check.rc != 0
+
+    - name: Check the Docker LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 04_provision_docker_lxc.yaml / 05_deploy_docker_stack.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the Docker LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Fail if the stack has not been deployed yet (.env missing — run 05 first)
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ compose_dir }}/.env"
+      register: env_check
+      changed_when: false
+      failed_when: env_check.rc != 0
+
+    # --- Re-push compose so repo image-tag bumps take effect -----------------
+    # pct push reads its source from the Proxmox host, not the controller —
+    # stage the compose file on the host first, then push and verify it landed.
+    - name: Stage the (possibly updated) docker-compose.yml on the Proxmox host
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/docker-compose.yml"
+        dest: /tmp/docker-stack-compose.yml
+        mode: "0644"
+
+    - name: Push the (possibly updated) docker-compose.yml into the container (and verify it landed)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'pct push {{ container_id }} /tmp/docker-stack-compose.yml {{ compose_dir }}/docker-compose.yml
+          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/docker-compose.yml'
+      register: push_compose
+      changed_when: push_compose.rc == 0
+
+    # --- Bump IMMICH_VERSION in the live .env (only when requested) ----------
+    - name: Bump IMMICH_VERSION in the live .env
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- sed -i
+          's|^IMMICH_VERSION=.*|IMMICH_VERSION={{ immich_version }}|'
+          {{ compose_dir }}/.env
+      when: immich_version is defined
+      register: bump_immich
+      changed_when: bump_immich.rc == 0
+
+    # --- Pull + recreate ------------------------------------------------------
+    - name: Pull updated images
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose pull'"
+      register: compose_pull
+      changed_when: "('Downloaded newer image' in compose_pull.stderr) or ('Pulled' in compose_pull.stderr)"
+
+    - name: Recreate the stack with the new images
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose up -d'"
+      register: compose_up
+      changed_when: >-
+        ('Started' in compose_up.stderr) or ('Recreate' in compose_up.stderr)
+        or ('Created' in compose_up.stderr)
+
+    - name: Read the resulting image versions
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose images'"
+      register: stack_images
+      changed_when: false
+
+    - name: Report deployment result
+      ansible.builtin.debug:
+        msg: "{{ stack_images.stdout_lines }}"

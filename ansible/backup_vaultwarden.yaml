@@ -1,0 +1,243 @@
+---
+# Recurrent task: produce an ENCRYPTED, off-box backup of the VaultWarden vault.
+#
+# Why this exists: LUKS only protects the data at rest against theft of the disk.
+# It does nothing against deletion, corruption, or a bad migration on the live,
+# unlocked box. The vault is the highest-value asset here — losing
+# vaultwarden_data loses every password, irrecoverably.
+#
+# There is no remote server to push to. Instead this rides the owner's existing
+# off-box pipeline: Immich photos + Syncthing files are already pulled to a
+# personal machine and rsync'd to two USB drives (one weekly on-site, one off-site
+# every few months). This playbook drops an age-ENCRYPTED archive of the vault
+# into a Syncthing-shared folder so it travels the same path automatically.
+#
+# Encryption is age ASYMMETRIC: the public key (recipient) lives on the box so
+# backups encrypt non-interactively (schedulable), while the PRIVATE key is
+# printed ONCE on first run and must be stored OFFLINE. An attacker who steals the
+# box AND a USB drive still cannot decrypt the vault — the private key was on
+# neither. (Same generate-once / print-once pattern as the /admin token in
+# 07_deploy_vaultwarden.yaml.)
+#
+# Self-contained, like unlock_storage.yaml / update_vaultwarden.yaml.
+#
+# Usage:
+#   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder>
+#   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_backups=14
+#
+# Restore (needs the OFFLINE private key — see README):
+#   age -d -i <private-key-file> vault-<ts>.age | tar xz -C <restore-dir>
+- name: Back up the VaultWarden vault (encrypted) to the Syncthing pipeline
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep these in sync with 06/07_*vaultwarden*.yaml and update_vaultwarden.yaml
+    # (these magic values are duplicated, not shared).
+    container_id: 101
+    secure_storage_path: /mnt/pve/secure-storage
+    data_subdir: vaultwarden_data
+    # Reuse the vault backups dir (also used by update_vaultwarden.yaml for its
+    # upgrade snapshots). The age recipient and the brief plaintext staging copy
+    # both live here, on the encrypted volume.
+    vault_backups_root: "{{ secure_storage_path }}/vaultwarden_backups"
+    age_recipient_file: "{{ vault_backups_root }}/age-recipient.pub"
+    staging_dir: "{{ vault_backups_root }}/.staging"
+    keep_backups: 7
+    # syncthing_drop_dir is REQUIRED via -e: the host path of a folder Syncthing
+    # already shares with the personal machine (so the .age archive auto-syncs and
+    # then rides the existing USB backup). No default — fail fast if absent.
+
+  tasks:
+    # --- Phase 1: guards (same preconditions as update_vaultwarden.yaml) ------
+    - name: Fail if syncthing_drop_dir was not provided
+      ansible.builtin.fail:
+        msg: "syncthing_drop_dir is required. Pass -e syncthing_drop_dir=<host path of a Syncthing-shared folder> so the encrypted archive auto-syncs off-box."
+      when: syncthing_drop_dir is undefined or (syncthing_drop_dir | length == 0)
+
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first — the vault data and the staging copy live on the encrypted volume."
+      when: secure_mount_check.rc != 0
+
+    - name: Confirm the Syncthing drop directory exists
+      ansible.builtin.stat:
+        path: "{{ syncthing_drop_dir }}"
+      register: drop_stat
+
+    - name: Fail if the Syncthing drop directory does not exist
+      ansible.builtin.fail:
+        msg: "{{ syncthing_drop_dir }} does not exist or is not a directory. Point it at an existing Syncthing-shared folder on the box."
+      when: not drop_stat.stat.exists or not drop_stat.stat.isdir
+
+    - name: Check the VaultWarden LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the VaultWarden LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Provision and deploy it first (06/07_*vaultwarden*.yaml)."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the VaultWarden LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Confirm the vault database exists (nothing to back up otherwise)
+      ansible.builtin.stat:
+        path: "{{ secure_storage_path }}/{{ data_subdir }}/db.sqlite3"
+      register: vault_db_stat
+
+    - name: Fail if there is no vault database to back up
+      ansible.builtin.fail:
+        msg: "No vault DB at {{ secure_storage_path }}/{{ data_subdir }}/db.sqlite3. Deploy and initialize VaultWarden first (07_deploy_vaultwarden.yaml)."
+      when: not vault_db_stat.stat.exists
+
+    # --- Phase 2: age tooling + one-time keypair -----------------------------
+    - name: Ensure age is installed on the host
+      ansible.builtin.apt:
+        name: age
+        state: present
+        update_cache: yes
+
+    - name: Ensure the vault backups directory exists
+      ansible.builtin.file:
+        path: "{{ vault_backups_root }}"
+        state: directory
+        mode: "0700"
+
+    - name: Check whether the age recipient (public key) already exists
+      ansible.builtin.stat:
+        path: "{{ age_recipient_file }}"
+      register: recipient_stat
+
+    # Generate ONCE. age-keygen writes the full identity (comment lines incl. the
+    # public key, plus the AGE-SECRET-KEY line) to stdout. We persist ONLY the
+    # public key on the box and print the private identity once for offline
+    # storage — it is never written to disk here.
+    - name: Generate an age keypair (first run only)
+      ansible.builtin.command: age-keygen
+      register: age_keygen
+      when: not recipient_stat.stat.exists
+      changed_when: true
+      no_log: true
+
+    - name: Persist the age recipient (public key) on the box
+      ansible.builtin.copy:
+        content: "{{ age_keygen.stdout | regex_search('public key: (age1[0-9a-z]+)', '\\1') | first }}\n"
+        dest: "{{ age_recipient_file }}"
+        mode: "0644"
+      when: not recipient_stat.stat.exists
+
+    - name: Show the age PRIVATE key (SAVE IT OFFLINE NOW — shown only once)
+      ansible.builtin.debug:
+        msg:
+          - "age PRIVATE key for VaultWarden backups — store it OFFLINE now (write it down / keep it with the off-site USB / in a second password manager). It is NOT recoverable and is required to decrypt every backup:"
+          - "{{ age_keygen.stdout_lines }}"
+      when: not recipient_stat.stat.exists
+
+    # --- Phase 3: consistent snapshot (brief stop -> copy -> start) ----------
+    # Stopping VaultWarden guarantees the SQLite DB is closed and consistent (no
+    # WAL races) without any extra host tooling. Wrapped so the service is ALWAYS
+    # restarted, even if the copy fails. Downtime is ~the copy of a small DB.
+    - name: Snapshot the vault data with the service stopped
+      block:
+        - name: Reset a clean staging directory
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: "{{ item }}"
+            mode: "0700"
+          loop:
+            - absent
+            - directory
+
+        - name: Stop VaultWarden for a consistent snapshot
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl stop vaultwarden"
+          register: stop_svc
+          changed_when: stop_svc.rc == 0
+
+        # cp -a preserves the 101000:101000 id-shift ownership, so a restore stays
+        # writable by the in-container service user.
+        - name: Copy the vault data into staging (on the encrypted volume)
+          ansible.builtin.command: "cp -a {{ secure_storage_path }}/{{ data_subdir }}/. {{ staging_dir }}/"
+          register: snap_copy
+          changed_when: snap_copy.rc == 0
+
+        - name: Restart VaultWarden (snapshot taken)
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          register: start_svc
+          changed_when: start_svc.rc == 0
+
+      rescue:
+        - name: Ensure VaultWarden is restarted after a snapshot failure
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          changed_when: true
+          failed_when: false
+
+        - name: Remove the staging directory after a snapshot failure
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: absent
+
+        - name: Fail the play after a snapshot failure
+          ansible.builtin.fail:
+            msg: "Snapshot of the vault data failed; VaultWarden was restarted and staging cleaned. Investigate before retrying."
+
+    # --- Phase 4: encrypt + drop (no plaintext tar ever hits disk) -----------
+    - name: Timestamp for this backup
+      ansible.builtin.command: date +%Y%m%d-%H%M%S
+      register: ts_cmd
+      changed_when: false
+
+    - name: Compute the archive path
+      ansible.builtin.set_fact:
+        archive_path: "{{ syncthing_drop_dir }}/vault-{{ ts_cmd.stdout }}.age"
+
+    # Pipe tar straight into age so the plaintext tarball is never written out;
+    # only the encrypted .age lands in the (synced) drop directory.
+    - name: Create the encrypted archive in the Syncthing drop directory
+      ansible.builtin.shell:
+        cmd: "set -o pipefail && tar -czf - -C {{ staging_dir }} . | age -R {{ age_recipient_file }} -o {{ archive_path }}"
+        executable: /bin/bash
+      register: encrypt
+      changed_when: encrypt.rc == 0
+
+    # 0644 is safe — the archive is age-encrypted — and keeps it readable by the
+    # Syncthing process across the unprivileged-LXC id-shift.
+    - name: Set archive permissions
+      ansible.builtin.file:
+        path: "{{ archive_path }}"
+        mode: "0644"
+
+    # --- Phase 5: housekeeping ----------------------------------------------
+    # Pruned archives also disappear from the personal machine on the next sync —
+    # long-term history is kept on the USB drives by design, not in the live folder.
+    - name: Prune old encrypted archives (keep the most recent N)
+      ansible.builtin.shell:
+        cmd: "cd {{ syncthing_drop_dir }} && ls -1t vault-*.age 2>/dev/null | tail -n +{{ keep_backups + 1 }} | xargs -r rm -f"
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ staging_dir }}"
+        state: absent
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg:
+          - "Encrypted vault backup written to {{ archive_path }} (keeping the {{ keep_backups }} most recent vault-*.age)."
+          - "It will sync to the personal machine via Syncthing, then ride the USB backup."
+          - "Restore with the OFFLINE private key: age -d -i <key-file> {{ archive_path }} | tar xz -C <restore-dir>"

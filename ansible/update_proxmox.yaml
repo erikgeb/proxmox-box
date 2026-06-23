@@ -1,0 +1,75 @@
+---
+# Recurrent maintenance: apt update + full dist-upgrade of the Proxmox HOST and
+# its LXC guests (100 docker, 101 vaultwarden). Self-contained, in ansible/ root
+# like unlock_storage.yaml / update_vaultwarden.yaml.
+#
+# Reboots are NOT performed automatically — the box is owner-operated and a reboot
+# also requires a manual LUKS unlock (unlock_storage.yaml) afterwards. The play
+# only REPORTS whether a reboot is pending so it can be scheduled deliberately.
+#
+# Day-to-day SECURITY patches are handled separately and automatically by
+# unattended-upgrades (bootstrap/08_enable_unattended_upgrades.yaml). This is the
+# deliberate, owner-initiated FULL upgrade, including PVE/Ceph packages.
+#
+# Usage:
+#   ansible-playbook ansible/update_proxmox.yaml
+- name: Update the Proxmox host and its LXC guests
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # The LXC guests to upgrade if present and running (keep in sync with the
+    # container IDs used by the provisioning playbooks).
+    guest_container_ids:
+      - 100
+      - 101
+
+  tasks:
+    # --- Host -----------------------------------------------------------------
+    - name: Update apt cache and full dist-upgrade the host
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+
+    # --- Guests ---------------------------------------------------------------
+    - name: Check the status of each LXC guest
+      ansible.builtin.command: "pct status {{ item }}"
+      loop: "{{ guest_container_ids }}"
+      register: guest_status
+      changed_when: false
+      failed_when: false
+
+    - name: Full-upgrade each running guest (skips missing/stopped containers)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ item.item }} -- bash -c '
+          set -euo pipefail;
+          export DEBIAN_FRONTEND=noninteractive;
+          apt-get update;
+          apt-get -y full-upgrade;
+          apt-get -y autoremove
+          '
+      loop: "{{ guest_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.rc == 0
+        - "'status: running' in item.stdout"
+      register: guest_upgrade
+      changed_when: "'0 upgraded, 0 newly installed' not in guest_upgrade.stdout"
+
+    # --- Reboot awareness (report only — never auto-reboot) -------------------
+    - name: Check whether the host needs a reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: host_reboot
+
+    - name: Report upgrade result
+      ansible.builtin.debug:
+        msg:
+          - "Host upgraded. Reboot required: {{ 'YES — reboot manually, then run unlock_storage.yaml' if host_reboot.stat.exists else 'no' }}"
+          - "Guests processed: {{ guest_container_ids | join(', ') }} (running ones upgraded; missing/stopped skipped)."
+          - "PVE kernel/package updates may need a manual reboot; security-only patches are handled by unattended-upgrades."

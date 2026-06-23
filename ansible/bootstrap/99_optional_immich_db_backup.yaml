@@ -1,0 +1,125 @@
+---
+# OPTIONAL, one-time: enable Immich's built-in periodic DATABASE backup via the
+# Immich admin API.
+#
+# Non-destructive by design: it GETs the current system config, merges in ONLY the
+# backup.database block, and PUTs the whole thing back. Every other setting is
+# preserved and the Settings UI stays editable — unlike the IMMICH_CONFIG_FILE
+# approach, which would make the entire Settings page read-only and reset omitted
+# keys to their defaults.
+#
+# What it gives you: Immich periodically pg_dumps its DB into UPLOAD_LOCATION/backups
+# (i.e. /mnt/storage/immich_data/backups on the box). The weekly photo rsync in the
+# README already includes backups/, so these dumps ride off-box to the USB drives
+# with no extra work. NB the dump is METADATA ONLY (albums, tags, named people,
+# etc.) — not the photos, which are backed up as files by that same rsync.
+#
+# Unlike the other bootstrap playbooks this one targets the controller (localhost),
+# not the proxmox host: it only talks to Immich's HTTP API over the LAN (the Docker
+# LXC publishes 2283 directly). No SSH/become needed.
+#
+# Prereqs: Immich deployed and running (05), storage unlocked, and an admin API key
+# in ansible/resources/immich.env (copy immich.env.example).
+#
+# Usage:
+#   ansible-playbook ansible/bootstrap/99_optional_immich_db_backup.yaml
+#   ansible-playbook ansible/bootstrap/99_optional_immich_db_backup.yaml -e keep_amount=4
+#   ansible-playbook ansible/bootstrap/99_optional_immich_db_backup.yaml -e immich_host=192.168.0.53
+- name: Enable Immich's built-in periodic database backup (optional)
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  become: no
+
+  vars:
+    # The Docker LXC's direct Immich port (compose publishes 2283:2283). Override
+    # immich_host to match your docker_host_ip_suffix if it is not the 53 default.
+    immich_host: "192.168.0.53"
+    immich_port: 2283
+    immich_base_url: "http://{{ immich_host }}:{{ immich_port }}"
+    resources_dir: "{{ playbook_dir }}/../resources"
+    immich_env_file: "{{ resources_dir }}/immich.env"
+    # Schedule: Saturday 23:00 (cron day-of-week 6 = Saturday). keep_amount = how
+    # many dumps Immich retains in UPLOAD_LOCATION/backups before pruning the oldest.
+    backup_cron: "0 23 * * 6"
+    keep_amount: 8
+    # immich_api_key may also be supplied with -e (it then overrides the env file).
+
+  tasks:
+    # --- Resolve the admin API key ------------------------------------------
+    - name: Check for the immich.env file
+      ansible.builtin.stat:
+        path: "{{ immich_env_file }}"
+      register: immich_env_stat
+
+    - name: Read the API key from immich.env (when not provided via -e)
+      ansible.builtin.set_fact:
+        immich_api_key: "{{ lookup('ansible.builtin.file', immich_env_file) | regex_search('(?m)^\\s*IMMICH_API_KEY\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+      when:
+        - immich_api_key is undefined
+        - immich_env_stat.stat.exists
+      no_log: true
+
+    - name: Fail if no API key is available
+      ansible.builtin.fail:
+        msg: "No Immich API key. Put IMMICH_API_KEY=... in {{ immich_env_file }} (copy immich.env.example) or pass -e immich_api_key=... It must be an ADMIN key with system-config read+update permission."
+      when: (immich_api_key is undefined) or (immich_api_key | length == 0)
+
+    # --- Fetch -> merge -> apply --------------------------------------------
+    - name: Fetch the current Immich system config
+      ansible.builtin.uri:
+        url: "{{ immich_base_url }}/api/system-config"
+        method: GET
+        headers:
+          x-api-key: "{{ immich_api_key }}"
+        return_content: yes
+        status_code: 200
+      register: current_config
+      no_log: true
+
+    # combine(..., recursive=true) overrides ONLY backup.database, leaving every
+    # other section of the config exactly as it was.
+    - name: Build the desired config (override only backup.database)
+      ansible.builtin.set_fact:
+        desired_config: "{{ current_config.json | combine({'backup': {'database': {'enabled': true, 'cronExpression': backup_cron, 'keepLastAmount': (keep_amount | int)}}}, recursive=true) }}"
+      no_log: true
+
+    - name: Report current vs desired backup settings
+      ansible.builtin.debug:
+        msg:
+          - "Current backup.database: {{ current_config.json.backup.database | default('(unset)') }}"
+          - "Desired backup.database: {enabled: true, cronExpression: {{ backup_cron }}, keepLastAmount: {{ keep_amount }}}"
+
+    - name: Nothing to do — Immich already has these backup settings
+      ansible.builtin.meta: end_play
+      when: (current_config.json.backup.database | default({})) == desired_config.backup.database
+
+    - name: Apply the updated system config (full-config PUT)
+      ansible.builtin.uri:
+        url: "{{ immich_base_url }}/api/system-config"
+        method: PUT
+        headers:
+          x-api-key: "{{ immich_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body: "{{ desired_config }}"
+        status_code: 200
+      register: put_result
+      no_log: true
+
+    - name: Verify the backup settings were applied
+      ansible.builtin.uri:
+        url: "{{ immich_base_url }}/api/system-config"
+        method: GET
+        headers:
+          x-api-key: "{{ immich_api_key }}"
+        status_code: 200
+      register: verify_config
+      no_log: true
+
+    - name: Report result
+      ansible.builtin.debug:
+        msg:
+          - "Immich periodic DB backup ENABLED: {{ verify_config.json.backup.database }}"
+          - "Dumps land in UPLOAD_LOCATION/backups (/mnt/storage/immich_data/backups on the box) and ride the weekly photo rsync off-box."
+          - "Confirm in the UI (still editable): Administration -> Settings -> Backup Settings."

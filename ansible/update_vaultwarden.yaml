@@ -1,0 +1,346 @@
+---
+# Recurrent task: upgrade (or downgrade) the native VaultWarden binary in LXC 101.
+#
+# This is the automated, safe-by-default counterpart to manually bumping the
+# version in bootstrap/07_deploy_vaultwarden.yaml. It is self-contained (it does
+# not import 07) — the same convention as unlock_storage.yaml, which likewise
+# lives in ansible/ root and reuses bootstrap logic for a recurrent operation.
+#
+# Flow: determine target version -> no-op if already installed -> stop service +
+# snapshot the vault data AND the current binary/web-vault -> re-extract the
+# target from the official image (via LXC 100's Docker, like 07) -> ldd guard ->
+# restart -> health-check /alive. If the new version fails to come up, it
+# AUTOMATICALLY rolls back the binary, web-vault and data, then fails loudly.
+#
+# Usage:
+#   ansible-playbook ansible/update_vaultwarden.yaml                       # latest stable release
+#   ansible-playbook ansible/update_vaultwarden.yaml -e target_version=1.33.0   # pin a version (also how to roll back)
+#
+# Note: snapshots land on the SAME encrypted volume — they guard against a bad
+# upgrade (corruption / failed migration), NOT against disk loss. Off-box backup
+# remains a separate backlog item.
+- name: Update the native VaultWarden binary in LXC 101
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep these in sync with 06/07_*vaultwarden*.yaml (duplicated, not shared).
+    container_id: 101
+    # The Docker LXC — used at update time only, to extract the binary from the
+    # official image (101 has no Docker). Not a runtime dependency.
+    docker_container_id: 100
+    secure_storage_path: /mnt/pve/secure-storage
+    data_subdir: vaultwarden_data
+    vaultwarden_ip: "192.168.0.54"
+    rocket_port: 8000
+    bin_path: /usr/local/bin/vaultwarden
+    share_dir: /usr/local/share/vaultwarden
+    vaultwarden_repo: dani-garcia/vaultwarden
+    vaultwarden_image_repo: vaultwarden/server
+    backups_root: "{{ secure_storage_path }}/vaultwarden_backups"
+    keep_backups: 5
+    # target_version may be supplied with -e target_version=X.Y.Z to pin the
+    # upgrade (or to roll back); otherwise the latest stable release is used.
+
+  tasks:
+    # --- Phase 1: guards (same preconditions as 07) --------------------------
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first — the vault data and snapshots live on the encrypted volume."
+      when: secure_mount_check.rc != 0
+
+    - name: Check the VaultWarden LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the VaultWarden LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Provision and deploy it first (06/07_*vaultwarden*.yaml)."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the VaultWarden LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Check the Docker LXC status (needed to extract the new binary)
+      ansible.builtin.command: "pct status {{ docker_container_id }}"
+      register: docker_ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC is not running
+      ansible.builtin.fail:
+        msg: "Container {{ docker_container_id }} is not running. It is needed to extract the VaultWarden binary from the official image — run unlock_storage.yaml first."
+      when: "'status: running' not in docker_ct_status.stdout"
+
+    # --- Phase 2: determine versions ----------------------------------------
+    - name: Look up the latest VaultWarden release (when target_version not pinned)
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ vaultwarden_repo }}/releases/latest"
+        return_content: yes
+      delegate_to: localhost
+      become: no
+      register: gh_release
+      when: target_version is undefined
+
+    - name: Resolve the target version from the latest release
+      ansible.builtin.set_fact:
+        target_version: "{{ gh_release.json.tag_name }}"
+      when: target_version is undefined
+
+    - name: Fail if the target version could not be determined
+      ansible.builtin.fail:
+        msg: "Could not determine a target version. Pass one explicitly with -e target_version=X.Y.Z."
+      when: target_version is undefined or (target_version | length == 0)
+
+    - name: Read the installed VaultWarden version
+      ansible.builtin.command: "pct exec {{ container_id }} -- cat {{ share_dir }}/VERSION"
+      register: installed_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Record the installed version
+      ansible.builtin.set_fact:
+        installed_version: "{{ (installed_probe.stdout | trim) if installed_probe.rc == 0 else 'none' }}"
+
+    - name: Report the planned action
+      ansible.builtin.debug:
+        msg: "VaultWarden — installed: {{ installed_version }} | target: {{ target_version }}"
+
+    - name: Nothing to do — already on the target version
+      ansible.builtin.meta: end_play
+      when: installed_version == target_version
+
+    # --- Phase 3: pre-upgrade snapshot (consistent: service stopped first) ---
+    - name: Stop VaultWarden for a consistent snapshot
+      ansible.builtin.command: "pct exec {{ container_id }} -- systemctl stop vaultwarden"
+      register: stop_svc
+      changed_when: stop_svc.rc == 0
+      failed_when: false
+
+    - name: Timestamp for this snapshot
+      ansible.builtin.command: date +%Y%m%d-%H%M%S
+      register: ts_cmd
+      changed_when: false
+
+    - name: Compute the snapshot directory path
+      ansible.builtin.set_fact:
+        backup_dir: "{{ backups_root }}/{{ ts_cmd.stdout }}_{{ installed_version }}"
+
+    - name: Create the snapshot directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    # cp -a preserves the 101000:101000 ownership the data dir carries (the
+    # unprivileged-LXC id-shift), so a restore stays writable by the service.
+    - name: Snapshot the vault data directory
+      ansible.builtin.command: "cp -a {{ secure_storage_path }}/{{ data_subdir }} {{ backup_dir }}/data"
+      register: snap_data
+      changed_when: snap_data.rc == 0
+
+    # Snapshot the current binary + web-vault as relative paths so rollback is a
+    # plain `tar x -C /` (no re-extraction of the old image needed).
+    - name: Snapshot the current binary and web-vault
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          tar czf /tmp/vw-rollback.tgz -C / usr/local/bin/vaultwarden usr/local/share/vaultwarden
+          '
+      register: snap_tar
+      changed_when: snap_tar.rc == 0
+
+    - name: Pull the rollback artifacts to the snapshot directory
+      ansible.builtin.command: "pct pull {{ container_id }} /tmp/vw-rollback.tgz {{ backup_dir }}/artifacts.tgz"
+      register: snap_pull
+      changed_when: snap_pull.rc == 0
+
+    - name: Remove the in-container rollback tar
+      ansible.builtin.command: "pct exec {{ container_id }} -- rm -f /tmp/vw-rollback.tgz"
+      changed_when: false
+
+    # --- Phase 4: apply the upgrade, with automatic rollback on failure ------
+    - name: Apply the upgrade
+      block:
+        - name: Extract the new binary + web-vault inside the Docker LXC
+          ansible.builtin.command:
+            cmd: >-
+              pct exec {{ docker_container_id }} -- bash -c '
+              set -euo pipefail;
+              docker rm -f vw-extract >/dev/null 2>&1 || true;
+              docker create --name vw-extract {{ vaultwarden_image_repo }}:{{ target_version }} >/dev/null;
+              docker cp vw-extract:/vaultwarden /tmp/vaultwarden;
+              docker cp vw-extract:/web-vault /tmp/web-vault;
+              tar czf /tmp/web-vault.tgz -C /tmp web-vault;
+              rm -rf /tmp/web-vault;
+              docker rm -f vw-extract >/dev/null
+              '
+          register: vw_extract
+          changed_when: vw_extract.rc == 0
+
+        - name: Pull the new binary to the host
+          ansible.builtin.command: "pct pull {{ docker_container_id }} /tmp/vaultwarden /tmp/vw-vaultwarden --perms 0755"
+          register: pull_bin
+          changed_when: pull_bin.rc == 0
+
+        - name: Pull the new web-vault archive to the host
+          ansible.builtin.command: "pct pull {{ docker_container_id }} /tmp/web-vault.tgz /tmp/vw-web-vault.tgz"
+          register: pull_web
+          changed_when: pull_web.rc == 0
+
+        # Source is already on the host (pulled from LXC 100 above) — verify the
+        # file landed in the container after pushing.
+        - name: Push the new binary into the VaultWarden LXC (and verify it landed)
+          ansible.builtin.command:
+            cmd: >-
+              bash -c 'pct push {{ container_id }} /tmp/vw-vaultwarden {{ bin_path }} --perms 0755
+              && pct exec {{ container_id }} -- test -f {{ bin_path }}'
+          register: push_bin
+          changed_when: push_bin.rc == 0
+
+        - name: Push the new web-vault archive into the VaultWarden LXC (and verify it landed)
+          ansible.builtin.command:
+            cmd: >-
+              bash -c 'pct push {{ container_id }} /tmp/vw-web-vault.tgz /tmp/web-vault.tgz
+              && pct exec {{ container_id }} -- test -f /tmp/web-vault.tgz'
+          register: push_web
+          changed_when: push_web.rc == 0
+
+        - name: Unpack the new web-vault and stamp the new version
+          ansible.builtin.command:
+            cmd: >-
+              pct exec {{ container_id }} -- bash -c '
+              set -euo pipefail;
+              mkdir -p {{ share_dir }};
+              rm -rf {{ share_dir }}/web-vault;
+              tar xzf /tmp/web-vault.tgz -C {{ share_dir }};
+              rm -f /tmp/web-vault.tgz;
+              echo {{ target_version }} > {{ share_dir }}/VERSION
+              '
+          register: vw_unpack
+          changed_when: vw_unpack.rc == 0
+
+        # A new version may add a linked library; install the known set (idempotent)
+        # and then fail the apply (-> rollback) if ldd still reports anything missing.
+        - name: Ensure runtime libraries are present
+          ansible.builtin.command:
+            cmd: >-
+              pct exec {{ container_id }} -- bash -c '
+              set -euo pipefail;
+              export DEBIAN_FRONTEND=noninteractive;
+              apt-get update;
+              apt-get install -y ca-certificates libssl3 libpq5 libmariadb3
+              '
+          register: vw_libs
+          changed_when: "'Setting up' in vw_libs.stdout"
+
+        - name: Verify the new binary has no unresolved shared libraries
+          ansible.builtin.command: "pct exec {{ container_id }} -- ldd {{ bin_path }}"
+          register: vw_ldd
+          changed_when: false
+          failed_when: "'not found' in vw_ldd.stdout"
+
+        - name: Start VaultWarden on the new version
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          register: start_new
+          changed_when: start_new.rc == 0
+
+        # Health check from the controller (on the LAN) against the real endpoint —
+        # catches a binary that starts then crashes on a DB migration.
+        - name: Wait for VaultWarden to answer /alive on the new version
+          ansible.builtin.uri:
+            url: "http://{{ vaultwarden_ip }}:{{ rocket_port }}/alive"
+            status_code: 200
+          delegate_to: localhost
+          become: no
+          register: health
+          retries: 15
+          delay: 2
+          until: health.status == 200
+
+        - name: Clean up transfer artifacts (host + Docker LXC)
+          ansible.builtin.command:
+            cmd: >-
+              bash -c '
+              rm -f /tmp/vw-vaultwarden /tmp/vw-web-vault.tgz;
+              pct exec {{ docker_container_id }} -- rm -f /tmp/vaultwarden /tmp/web-vault.tgz
+              '
+          changed_when: false
+          failed_when: false
+
+      rescue:
+        - name: Upgrade failed — rolling back
+          ansible.builtin.debug:
+            msg: "Upgrade to {{ target_version }} failed. Restoring {{ installed_version }} (binary + web-vault + data) from {{ backup_dir }}."
+
+        - name: Stop the failed service
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl stop vaultwarden"
+          changed_when: false
+          failed_when: false
+
+        - name: Push the snapshotted artifacts back into the container (and verify it landed)
+          ansible.builtin.command:
+            cmd: >-
+              bash -c 'pct push {{ container_id }} {{ backup_dir }}/artifacts.tgz /tmp/vw-rollback.tgz
+              && pct exec {{ container_id }} -- test -f /tmp/vw-rollback.tgz'
+          changed_when: true
+
+        - name: Restore the previous binary, web-vault and VERSION stamp
+          ansible.builtin.command:
+            cmd: >-
+              pct exec {{ container_id }} -- bash -c '
+              set -euo pipefail;
+              rm -rf {{ share_dir }}/web-vault;
+              tar xzf /tmp/vw-rollback.tgz -C /;
+              rm -f /tmp/vw-rollback.tgz
+              '
+          changed_when: true
+
+        - name: Restore the vault data directory
+          ansible.builtin.command:
+            cmd: >-
+              bash -c '
+              set -euo pipefail;
+              rm -rf {{ secure_storage_path }}/{{ data_subdir }};
+              cp -a {{ backup_dir }}/data {{ secure_storage_path }}/{{ data_subdir }}
+              '
+          changed_when: true
+
+        - name: Restart the restored (previous) version
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          changed_when: true
+          failed_when: false
+
+        - name: Fail the play after rollback
+          ansible.builtin.fail:
+            msg: "VaultWarden upgrade to {{ target_version }} FAILED and was rolled back to {{ installed_version }}. Snapshot retained at {{ backup_dir }}. Investigate: pct exec {{ container_id }} -- journalctl -u vaultwarden -n 80"
+
+    # --- Phase 5: success housekeeping --------------------------------------
+    - name: Prune old snapshots (keep the most recent N)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c '
+          cd {{ backups_root }} && ls -1dt */ 2>/dev/null | tail -n +{{ keep_backups + 1 }} | xargs -r rm -rf
+          '
+      changed_when: false
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg:
+          - "VaultWarden upgraded {{ installed_version }} -> {{ target_version }} and is answering /alive."
+          - "Pre-upgrade snapshot retained at {{ backup_dir }} (keeping the {{ keep_backups }} most recent)."
+          - "Roll back manually if needed with: -e target_version={{ installed_version }}"
