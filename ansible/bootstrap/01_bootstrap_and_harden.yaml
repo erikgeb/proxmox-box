@@ -93,13 +93,23 @@
     # -------------------------------------------------------------------------
     # STEP 3: SECURITY HARDENING (DISABLE ROOT SSH)
     # -------------------------------------------------------------------------
-    - name: Disable Root SSH Login for security
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PermitRootLogin'
-        line: 'PermitRootLogin no'
-        state: present
+    # Use a drop-in under sshd_config.d so the setting can't be silently overridden
+    # by a later drop-in (Debian/Proxmox ship `Include /etc/ssh/sshd_config.d/*.conf`
+    # near the top of the main sshd_config). The `validate` runs `sshd -t` on the
+    # candidate file so a syntax error never lands on disk.
+    - name: Disable Root SSH Login for security (drop-in)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-disable-root.conf
+        content: "PermitRootLogin no\n"
+        owner: root
+        group: root
+        mode: '0644'
+        validate: 'sshd -t -f %s'
       notify: Restart SSH
+
+    - name: Validate the full merged SSH configuration before restarting
+      ansible.builtin.command: sshd -t
+      changed_when: false
 
   handlers:
     - name: Restart SSH
