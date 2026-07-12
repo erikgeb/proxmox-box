@@ -1,0 +1,142 @@
+---
+# Recurrent maintenance: install Caddy's Let's Encrypt wildcard certificate as the
+# Proxmox web UI (pveproxy) cert, so the box stops serving its untrusted self-signed
+# cert on the LAN. Self-contained, in ansible/ root like unlock_storage.yaml /
+# update_proxmox.yaml / update_vaultwarden.yaml.
+#
+# How it works: Caddy (LXC 100) obtains and auto-renews a single wildcard cert
+# *.BASE_DOMAIN via ACME DNS-01 (OVH) and stores the cert + key on the encrypted
+# volume (caddy_data). This play reads that cert straight off the host filesystem
+# and hands it to `pvenode cert set`. No re-issuance — it reuses the cert Caddy
+# already owns.
+#
+# IMPORTANT — two consequences of reusing a *wildcard* cert:
+#   1. A wildcard *.BASE_DOMAIN does NOT cover the apex BASE_DOMAIN. Browse Proxmox
+#      at a SUBDOMAIN, e.g. https://pve.BASE_DOMAIN:8006 — and point that LAN DNS
+#      name at the PROXMOX HOST's IP (NOT LXC 100, which is where the apps live).
+#      Hitting the box by raw IP will still show a cert-name mismatch; that's expected.
+#      Moving from the apex to a subdomain is PURELY a DNS + browser-URL change and
+#      is trivially reversible — do NOT rename the PVE node hostname/FQDN to match
+#      (its internal identity is unrelated to the browse URL, and renaming it is the
+#      genuinely risky operation). Nothing inside Proxmox changes.
+#   2. Caddy auto-renews (~30 days before expiry); the copy installed here is a
+#      point-in-time snapshot and goes stale. RE-RUN this play periodically (e.g.
+#      monthly via cron) to refresh it. It is idempotent: it only touches pveproxy
+#      when the Caddy cert has actually changed, so re-running is a cheap no-op.
+#
+# If Caddy has not issued the wildcard cert yet (e.g. deployed but never reached, or
+# the encrypted volume is unlocked but empty), the play reports that and exits
+# cleanly without touching Proxmox's cert.
+#
+# Usage:
+#   ansible-playbook ansible/update_proxmox_cert.yaml
+- name: Install Caddy's wildcard certificate for the Proxmox web UI
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Host-side path of the encrypted volume and Caddy's data dir on it (bind-mounted
+    # into LXC 100 as /data — see docker-compose.yml). Caddy lays its certs out under
+    # caddy/certificates/<acme-ca-dir>/<sanitized-domain>/, naming the wildcard dir
+    # and files "wildcard_.<domain>" (the '*' is sanitized to "wildcard_").
+    secure_storage_mount: /mnt/pve/secure-storage
+    caddy_certificates_dir: /mnt/pve/secure-storage/caddy_data/caddy/certificates
+    # Proxmox's custom-cert slot. When present, pveproxy serves this instead of the
+    # self-signed node cert (/etc/pve/local/pve-ssl.pem).
+    pveproxy_cert: /etc/pve/local/pveproxy-ssl.pem
+
+  tasks:
+    # --- Guard: the cert lives on the encrypted volume, which is unlocked manually ---
+    - name: Check whether the encrypted volume is mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_mount }}"
+      register: ss_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Fail clearly if the encrypted volume is not mounted
+      ansible.builtin.fail:
+        msg: >-
+          {{ secure_storage_mount }} is not mounted, so Caddy's cert is unreachable.
+          Run unlock_storage.yaml first, then re-run this play.
+      when: ss_mount.rc != 0
+
+    # --- Locate Caddy's wildcard certificate ---------------------------------------
+    - name: Search for a Caddy wildcard certificate on the encrypted volume
+      ansible.builtin.command: "find {{ caddy_certificates_dir }} -type f -name 'wildcard_*.crt'"
+      register: cert_find
+      changed_when: false
+      failed_when: false
+
+    - name: Report and exit if Caddy has not issued a wildcard certificate yet
+      when: cert_find.stdout_lines | length == 0
+      block:
+        - name: Explain that no wildcard certificate was found
+          ansible.builtin.debug:
+            msg: >-
+              No wildcard certificate found under {{ caddy_certificates_dir }}.
+              Caddy issues it on first start once DNS-01 succeeds — deploy/start the
+              Docker stack (05_deploy_docker_stack.yaml) and let Caddy obtain it,
+              then re-run this play. Proxmox's cert was left untouched.
+
+        - name: End the play (nothing to install)
+          ansible.builtin.meta: end_play
+
+    # Prefer the Let's Encrypt PRODUCTION cert if a staging one also exists; otherwise
+    # take whatever single wildcard cert is present.
+    - name: Select the wildcard certificate and its key
+      ansible.builtin.set_fact:
+        wildcard_cert: "{{ (prod_match if prod_match | length > 0 else cert_find.stdout_lines)[0] }}"
+      vars:
+        prod_match: "{{ cert_find.stdout_lines | select('search', 'acme-v02.api.letsencrypt.org') | list }}"
+
+    - name: Derive the key path and the covered domain
+      ansible.builtin.set_fact:
+        wildcard_key: "{{ wildcard_cert | regex_replace('\\.crt$', '.key') }}"
+        covered_domain: "{{ wildcard_cert | basename | regex_replace('^wildcard_\\.', '') | regex_replace('\\.crt$', '') }}"
+
+    - name: Warn if more than one wildcard certificate was found
+      ansible.builtin.debug:
+        msg: >-
+          Found {{ cert_find.stdout_lines | length }} wildcard certs; using
+          {{ wildcard_cert }}. (Others: {{ cert_find.stdout_lines | difference([wildcard_cert]) | join(', ') }})
+      when: cert_find.stdout_lines | length > 1
+
+    # --- Decide whether anything changed (idempotency) -----------------------------
+    - name: Fingerprint the Caddy wildcard certificate
+      ansible.builtin.command: "openssl x509 -in {{ wildcard_cert }} -noout -fingerprint -sha256"
+      register: src_fp
+      changed_when: false
+
+    - name: Fingerprint the certificate pveproxy currently serves (if a custom one is set)
+      ansible.builtin.command: "openssl x509 -in {{ pveproxy_cert }} -noout -fingerprint -sha256"
+      register: cur_fp
+      changed_when: false
+      failed_when: false
+
+    - name: Determine whether the installed cert needs updating
+      ansible.builtin.set_fact:
+        cert_changed: "{{ src_fp.stdout != cur_fp.stdout }}"
+
+    # --- Install (only when changed) -----------------------------------------------
+    # `pvenode cert set` validates that the key matches the cert, copies both into
+    # /etc/pve/local/pveproxy-ssl.{pem,key}, and (--restart) restarts pveproxy so the
+    # new cert is served immediately. --force overwrites any existing custom cert.
+    # This briefly drops the current web-UI session, which is expected.
+    - name: Install the wildcard certificate for the Proxmox web UI
+      ansible.builtin.command: "pvenode cert set {{ wildcard_cert }} {{ wildcard_key }} --force --restart"
+      when: cert_changed
+      changed_when: true
+
+    - name: Report the result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Installed/updated' if cert_changed else 'Already current — no change' }}:
+          Proxmox now serves the wildcard cert for *.{{ covered_domain }}. Reach the UI
+          at a SUBDOMAIN (e.g. https://pve.{{ covered_domain }}:8006) whose LAN DNS
+          points at this host's IP; the apex {{ covered_domain }} and the raw IP are
+          not covered by the wildcard. Moving to the subdomain is just a DNS + URL
+          change — do NOT rename the PVE node hostname (its internal identity is
+          unrelated to the browse URL and renaming it is risky). Re-run periodically
+          to keep it fresh as Caddy renews.
