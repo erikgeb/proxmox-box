@@ -149,27 +149,16 @@
     # --- Phase 3b: Caddy reverse proxy resources -----------------------------
     # Caddy needs its build context (Dockerfile), its config (Caddyfile, bind-
     # mounted read-only) and the OVH DNS-01 credentials (caddy.env). caddy.env
-    # is user-supplied and gitignored — refuse to deploy without it so Caddy is
-    # never brought up unable to obtain a cert.
-#    - name: Check that caddy.env exists alongside the resources
-#      ansible.builtin.stat:
-#        path: "{{ resources_dir }}/caddy.env"
-#      register: caddy_env_stat
-
-#    - name: Fail if caddy.env is missing
-#      ansible.builtin.fail:
-#        msg: "{{ resources_dir }}/caddy.env not found. Copy caddy.env.example -> caddy.env and fill in the OVH API credentials + BASE_DOMAIN before deploying."
-#      when: not caddy_env_stat.stat.exists
-
+    # is user-supplied and gitignored; the "Stage caddy.env" copy task below
+    # reads it from the controller (ansible.builtin.copy) and fails loudly if it
+    # is absent, so Caddy is never brought up unable to obtain a cert. (A prior
+    # ansible.builtin.stat guard here was wrong — it ran on the remote host and
+    # so checked the controller-only resources path on Proxmox, where it never
+    # exists; the copy task is the real, correct guard.)
     - name: Ensure the Caddy build/config directory exists in the container
       ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ compose_dir }}/caddy"
       register: mk_caddy_dir
       changed_when: false
-
-#    - name: Ensure the Caddy data directory exists on the encrypted volume
-#      ansible.builtin.command: "pct exec {{ container_id }} -- mkdir -p {{ mount_path }}/caddy_data"
-#      register: mk_caddy_data
-#      changed_when: false
 
     - name: Stage the Caddy Dockerfile on the Proxmox host
       ansible.builtin.copy:
