@@ -16,9 +16,30 @@
 # VaultWarden is a native binary in LXC 101 and is upgraded by its own playbook
 # (ansible/update_vaultwarden.yaml), not here.
 #
+# Safety guard: when -e immich_version= is passed (an Immich bump), this first
+# takes a logical pg_dumpall of the Immich DB, age-ENCRYPTS it, and drops it into
+# a Syncthing-shared folder (syncthing_drop_dir, REQUIRED when bumping Immich) so
+# it auto-syncs to the personal machine and rides the existing USB backup — the
+# same off-box pipeline as backup_vaultwarden.yaml. The bump does NOT proceed if
+# the dump fails. Why a backup at all: an Immich major bump can run an
+# IRREVERSIBLE DB migration (e.g. 2.x -> 3.0 pgvecto.rs -> VectorChord) with no
+# supported downgrade. Why encrypted: the dump leaves the LUKS volume (Immich
+# account hashes + personal metadata), so it is age-encrypted exactly like the
+# vault backup. It does NOT auto-roll back; restore is a manual step (the success
+# output prints how). A plain repo-tag pull (no immich_version) skips all of this.
+#
+# Encryption is age ASYMMETRIC, same generate-once/print-once flow as
+# backup_vaultwarden.yaml: the public recipient lives on the box (non-interactive
+# encryption), the PRIVATE key is printed ONCE and must be stored OFFLINE.
+#
 # Usage:
 #   ansible-playbook ansible/update_docker_stack.yaml                          # pull repo-pinned tags + recreate
-#   ansible-playbook ansible/update_docker_stack.yaml -e immich_version=v2.8.0 # also bump Immich
+#   ansible-playbook ansible/update_docker_stack.yaml \
+#     -e immich_version=v2.8.0 \
+#     -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/immich_db_backups   # snapshot+encrypt DB, then bump
+#
+# Restore (needs the OFFLINE private key — see README):
+#   age -d -i <key-file> immich-db-<ts>.sql.gz.age | gunzip | docker exec -i immich_postgres psql -U postgres -d postgres
 #
 # Requires the encrypted storage mounted (run unlock_storage.yaml first).
 - name: Update the Docker application stack in LXC 100
@@ -34,7 +55,17 @@
     compose_dir: /opt/docker-stack
     # This playbook lives in ansible/ root, so resources is alongside it.
     resources_dir: "{{ playbook_dir }}/resources"
+    immich_postgres_container: immich_postgres
+    # The age recipient (public key) for the pre-bump DB dump lives on the
+    # encrypted volume; the dumps themselves go to syncthing_drop_dir. keep_db_backups
+    # = how many encrypted dumps to retain in that folder.
+    immich_db_key_dir: "{{ secure_storage_path }}/immich_db_backups"
+    age_recipient_file: "{{ immich_db_key_dir }}/age-recipient.pub"
+    keep_db_backups: 3
     # immich_version is optional; supply with -e immich_version=vX.Y.Z to bump Immich.
+    # When immich_version IS passed, syncthing_drop_dir is REQUIRED via -e: the host
+    # path of a folder Syncthing already shares with the personal machine, so the
+    # encrypted dump auto-syncs off-box (e.g. .../syncthing_share/immich_db_backups).
 
   tasks:
     # --- Guards (same preconditions as 05) -----------------------------------
@@ -71,6 +102,164 @@
       register: env_check
       changed_when: false
       failed_when: env_check.rc != 0
+
+    # --- Pre-bump safety: snapshot + encrypt the Immich DB off-box -----------
+    # An Immich version bump can run an IRREVERSIBLE DB migration on first start
+    # (e.g. the 2.x -> 3.0 pgvecto.rs -> VectorChord cutover) with no supported
+    # downgrade below the cutover release. Take a logical pg_dumpall FIRST so a
+    # restorable copy exists if the new version fails to migrate. A logical dump
+    # (not a file copy of immich_db) is used deliberately: a major bump may also
+    # swap the Postgres image, and only a logical dump restores across that.
+    #
+    # The dump is age-ENCRYPTED and dropped into a Syncthing-shared folder so it
+    # auto-syncs to the personal machine and rides the USB backup — the same
+    # off-box path as backup_vaultwarden.yaml. Encrypted because it leaves the
+    # LUKS volume and contains Immich account hashes + personal metadata.
+    #
+    # Scope: gated on immich_version — a plain repo-tag pull (postgres/valkey/
+    # syncthing/caddy) carries no Immich DB-migration risk, so it is skipped then.
+    # It does NOT auto-roll back: a failed major migration also involves the
+    # Postgres image and data dir, so restore is a deliberate manual step (printed
+    # on success). If the dump fails, the play FAILS HERE — before the bump — so
+    # an Immich upgrade never proceeds without a backup.
+    - name: Fail if syncthing_drop_dir was not provided for the Immich bump
+      ansible.builtin.fail:
+        msg: "Bumping Immich (-e immich_version=) requires -e syncthing_drop_dir=<host path of a Syncthing-shared folder> so the encrypted pre-bump DB dump auto-syncs off-box."
+      when:
+        - immich_version is defined
+        - syncthing_drop_dir is undefined or (syncthing_drop_dir | length == 0)
+
+    - name: Confirm the Syncthing drop directory exists
+      ansible.builtin.stat:
+        path: "{{ syncthing_drop_dir }}"
+      register: drop_stat
+      when: immich_version is defined
+
+    - name: Fail if the Syncthing drop directory does not exist
+      ansible.builtin.fail:
+        msg: "{{ syncthing_drop_dir }} does not exist or is not a directory. Create the folder in the Syncthing UI first (so Syncthing owns it), then point syncthing_drop_dir at its host path."
+      when:
+        - immich_version is defined
+        - not drop_stat.stat.exists or not drop_stat.stat.isdir
+
+    - name: Resolve the DB superuser from the live .env (for pg_dumpall)
+      ansible.builtin.command: "pct exec {{ container_id }} -- bash -lc 'grep -E ^DB_USERNAME= {{ compose_dir }}/.env | cut -d= -f2'"
+      register: db_user_probe
+      changed_when: false
+      when: immich_version is defined
+
+    - name: Read the currently deployed Immich version (for the dump label)
+      ansible.builtin.command: "pct exec {{ container_id }} -- bash -lc 'grep -E ^IMMICH_VERSION= {{ compose_dir }}/.env | cut -d= -f2'"
+      register: immich_installed
+      changed_when: false
+      failed_when: false
+      when: immich_version is defined
+
+    - name: Timestamp for this snapshot
+      ansible.builtin.command: date +%Y%m%d-%H%M%S
+      register: db_ts_cmd
+      changed_when: false
+      when: immich_version is defined
+
+    - name: Compute the DB superuser and the encrypted archive path
+      ansible.builtin.set_fact:
+        db_username: "{{ db_user_probe.stdout | trim }}"
+        db_archive_path: "{{ syncthing_drop_dir }}/immich-db-{{ db_ts_cmd.stdout }}_{{ (immich_installed.stdout | trim) | default('unknown', true) | regex_replace('[^A-Za-z0-9._-]', '_') }}.sql.gz.age"
+      when: immich_version is defined
+
+    # --- age tooling + one-time keypair (mirrors backup_vaultwarden.yaml) -----
+    - name: Ensure age is installed on the host
+      ansible.builtin.apt:
+        name: age
+        state: present
+        update_cache: yes
+      when: immich_version is defined
+
+    - name: Ensure the Immich DB key directory exists (on the encrypted volume)
+      ansible.builtin.file:
+        path: "{{ immich_db_key_dir }}"
+        state: directory
+        mode: "0700"
+      when: immich_version is defined
+
+    - name: Check whether the age recipient (public key) already exists
+      ansible.builtin.stat:
+        path: "{{ age_recipient_file }}"
+      register: recipient_stat
+      when: immich_version is defined
+
+    # Generate ONCE: persist ONLY the public key on the box and print the private
+    # identity once for offline storage — it is never written to disk here.
+    - name: Generate an age keypair (first run only)
+      ansible.builtin.command: age-keygen
+      register: age_keygen
+      when:
+        - immich_version is defined
+        - not recipient_stat.stat.exists
+      changed_when: true
+      no_log: true
+
+    - name: Persist the age recipient (public key) on the box
+      ansible.builtin.copy:
+        content: "{{ age_keygen.stdout | regex_search('public key: (age1[0-9a-z]+)', '\\1') | first }}\n"
+        dest: "{{ age_recipient_file }}"
+        mode: "0644"
+      when:
+        - immich_version is defined
+        - not recipient_stat.stat.exists
+
+    - name: Show the age PRIVATE key (SAVE IT OFFLINE NOW — shown only once)
+      ansible.builtin.debug:
+        msg:
+          - "age PRIVATE key for Immich DB backups — store it OFFLINE now (write it down / keep it with the off-site USB / in your password manager). It is NOT recoverable and is required to decrypt every Immich DB dump:"
+          - "{{ age_keygen.stdout_lines }}"
+      when:
+        - immich_version is defined
+        - not recipient_stat.stat.exists
+
+    # --- dump -> gzip -> age, straight into the synced folder ----------------
+    # Wait for Postgres to accept connections — the LXC may have only just been
+    # started by the guard above (containers are restart:always but not instant).
+    - name: Wait for the Immich database to be ready
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- docker exec {{ immich_postgres_container }} pg_isready -U {{ db_username }}"
+      register: pg_ready
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: pg_ready.rc == 0
+      when: immich_version is defined
+
+    # No `docker exec -t` (a TTY would CRLF-corrupt the stream). pct exec streams
+    # pg_dumpall's stdout to the host, where it is gzipped then age-encrypted in
+    # one pipe — no plaintext dump ever hits disk. pipefail fails the task (and so
+    # the whole play, before the bump) if pg_dumpall errors.
+    - name: Dump, compress and encrypt the Immich DB into the Syncthing folder
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          pct exec {{ container_id }} -- docker exec {{ immich_postgres_container }}
+          pg_dumpall --clean --if-exists --username={{ db_username }}
+          | gzip | age -R {{ age_recipient_file }} -o {{ db_archive_path }}
+        executable: /bin/bash
+      register: db_dump
+      changed_when: db_dump.rc == 0
+      when: immich_version is defined
+
+    # 0644 is safe — the archive is age-encrypted — and lets the Syncthing process
+    # read it across the unprivileged-LXC id-shift. Also asserts it is non-empty.
+    - name: Make the encrypted dump readable by Syncthing (and assert non-empty)
+      ansible.builtin.file:
+        path: "{{ db_archive_path }}"
+        mode: "0644"
+      register: archive_file
+      failed_when: archive_file.size is not defined or archive_file.size == 0
+      when: immich_version is defined
+
+    - name: Report the pre-bump encrypted dump
+      ansible.builtin.debug:
+        msg: "Immich DB dumped + encrypted to {{ db_archive_path }} (Immich {{ immich_installed.stdout | trim | default('unknown', true) }}); it will sync off-box via Syncthing."
+      when: immich_version is defined
 
     # --- Re-push compose so repo image-tag bumps take effect -----------------
     # pct push reads its source from the Proxmox host, not the controller —
@@ -121,6 +310,43 @@
       register: stack_images
       changed_when: false
 
+    # --- Reclaim boot-disk space ---------------------------------------------
+    # Every `compose pull` + `up -d` leaves the previous image layers behind: a
+    # tag bump (or Immich version bump) repoints the tag, so the old image is now
+    # untagged/unused and just occupies the LXC rootfs (local-lvm, NOT the
+    # encrypted volume). Left unchecked this is the main thing that creeps the
+    # boot disk toward full over successive upgrades. `image prune -af` drops
+    # every image not backing a running container (all our images ARE running, so
+    # only the superseded ones go); `builder prune -f` clears the Caddy build
+    # cache. Named volumes (immich-model-cache, caddy-config) are untouched.
+    - name: Prune superseded images and build cache to reclaim boot-disk space
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc 'docker image prune -af && docker builder prune -f'"
+      register: docker_prune
+      changed_when: "'Total reclaimed space: 0B' not in docker_prune.stdout"
+
+    - name: Report reclaimed space
+      ansible.builtin.debug:
+        msg: "{{ docker_prune.stdout_lines | select('search', 'Total reclaimed space') | list }}"
+
+    # --- Post-bump housekeeping for the encrypted DB dump --------------------
+    # Pruned dumps also disappear from the personal machine on the next sync —
+    # long-term history is kept on the USB drives by design, not in the live folder.
+    - name: Prune old encrypted Immich DB dumps (keep the most recent N)
+      ansible.builtin.shell:
+        cmd: "cd {{ syncthing_drop_dir }} && ls -1t immich-db-*.sql.gz.age 2>/dev/null | tail -n +{{ keep_db_backups + 1 }} | xargs -r rm -f"
+        executable: /bin/bash
+      changed_when: false
+      when: immich_version is defined
+
     - name: Report deployment result
       ansible.builtin.debug:
         msg: "{{ stack_images.stdout_lines }}"
+
+    - name: Note the retained DB dump and how to restore it
+      ansible.builtin.debug:
+        msg:
+          - "Pre-bump Immich DB dump (encrypted) at {{ db_archive_path }} (keeping the {{ keep_db_backups }} most recent; syncs off-box via Syncthing)."
+          - "Verify the new Immich came up cleanly (watch for the first-start migration to finish): pct exec {{ container_id }} -- docker logs -f immich_server"
+          - "If the migration failed and you must restore (needs the OFFLINE age private key): stop the stack, RESET the immich_db data dir (a partially-migrated DB cannot be loaded into), bring up an empty Postgres, then: age -d -i <key-file> {{ db_archive_path }} | gunzip | docker exec -i {{ immich_postgres_container }} psql -U {{ db_username }} -d postgres   — and pin Immich back with -e immich_version=<old>. Match the Postgres image to that Immich version."
+      when: immich_version is defined
