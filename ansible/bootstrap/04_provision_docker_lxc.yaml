@@ -37,6 +37,15 @@
       - immich_db
       - syncthing_data
       - caddy_data
+    # syncthing_share holds user-synced DATA (bind-mounted to /data in the
+    # container), unlike syncthing_data (/config). The linuxserver/syncthing
+    # service runs as uid/gid 911 (PUID/PGID, pinned in docker-compose.yml) and
+    # does NOT auto-chown data mounts the way it does /config, so this dir must
+    # be owned by 911 -> host 100911 directly for Syncthing to manage folders
+    # (create .stfolder markers, write received files) beneath it.
+    syncthing_share_dir: syncthing_share
+    syncthing_share_host_uid: 100911
+    syncthing_share_host_gid: 100911
 
   tasks:
     # The bind mount must point at the *mounted* encrypted volume. If the volume is
@@ -143,6 +152,23 @@
       loop_control:
         label: "{{ item.stat.path }}"
       when: item.stat.uid == 0
+
+    # syncthing_share is owned by the Syncthing service uid (911 -> host 100911),
+    # not container-root, so Syncthing can create/manage sync folders under /data.
+    # Gated on host-root ownership so it only fires pre-first-run (a no-op once
+    # Syncthing or a synced file has taken the tree over), matching the claim above.
+    - name: Stat the Syncthing share dir
+      ansible.builtin.stat:
+        path: "{{ secure_storage_path }}/{{ syncthing_share_dir }}"
+      register: syncthing_share_stat
+
+    - name: Claim ownership of the Syncthing share dir for the service uid (pre-first-run only)
+      ansible.builtin.file:
+        path: "{{ syncthing_share_stat.stat.path }}"
+        owner: "{{ syncthing_share_host_uid }}"
+        group: "{{ syncthing_share_host_gid }}"
+        state: directory
+      when: syncthing_share_stat.stat.exists and syncthing_share_stat.stat.uid == 0
 
     - name: Display provisioning result
       ansible.builtin.debug:

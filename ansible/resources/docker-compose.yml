@@ -90,8 +90,14 @@ services:
     <<: *default-logging
     image: lscr.io/linuxserver/syncthing:v2.1.1-ls220
     container_name: syncthing
+    # Pin the service uid/gid so it maps to host 100911 under the unprivileged
+    # LXC id-shift (matches the syncthing_share chown in 04_provision_docker_lxc.yaml).
+    environment:
+      - PUID=911
+      - PGID=911
     volumes:
-      - /mnt/storage/syncthing_data:/config
+      - /mnt/storage/syncthing_data:/config         # Syncthing state (DB, keys, certs)
+      - /mnt/storage/syncthing_share:/data          # User-synced data; folder paths live under /data
     ports:
       - "8384:8384" # Admin GUI Port
       - "22000:22000/tcp"

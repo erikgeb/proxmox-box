@@ -137,7 +137,8 @@
       loop:
         - "immich_data"
         - "immich_db"
-        - "syncthing_data"
+        - "syncthing_data"     # Syncthing's own state (DB, keys, certs) -> /config
+        - "syncthing_share"    # User-synced data (personal files, vault backups) -> /data
         - "vaultwarden_data"
         - "caddy_data"        # Caddy ACME account + cert private keys (kept at rest)
 
