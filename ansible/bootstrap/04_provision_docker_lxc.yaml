@@ -12,8 +12,14 @@
     ostemplate: "local:vztmpl/{{ ostemplate_name }}"
     # rootfs lives on the boot disk (local-lvm), NOT the encrypted volume, so the
     # container's root filesystem is not gated behind the manual LUKS unlock.
+    # Sized for the Docker image set, not data (which lives on the encrypted bind
+    # mount): immich-server + immich-machine-learning (~3GB each), postgres (~1GB)
+    # and the regenerable immich-model-cache named volume (~6GB) all sit here, and
+    # an Immich bump transiently holds BOTH old and new images during `compose
+    # pull` (~6GB extra) before the post-upgrade prune runs. 20G left too little
+    # headroom for that transient; 32G keeps it comfortable as images grow.
     rootfs_storage: local-lvm
-    rootfs_size: 20
+    rootfs_size: 32
     cores: 4
     memory: 16384
     network_bridge: vmbr0
