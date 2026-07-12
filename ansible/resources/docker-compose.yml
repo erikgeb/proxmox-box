@@ -13,8 +13,21 @@ name: immich
 # pinned in .env. The postgres/valkey tags track upstream — re-check them when
 # bumping Immich. linuxserver/syncthing is pinned to a stable ls tag.
 
+# Cap container JSON logs so they can't grow unbounded on the LXC boot disk
+# (rootfs is on local-lvm, NOT the encrypted volume). Without this, Docker's
+# default json-file driver keeps every log line forever. 10m x 3 files = 30 MB
+# max per container. Applied to every service below via the *default-logging
+# anchor. immich-server is the chatty one this primarily reins in.
+x-logging: &default-logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   immich-server:
+    <<: *default-logging
     container_name: immich_server
     image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
     volumes:
@@ -34,6 +47,7 @@ services:
     restart: always
 
   immich-machine-learning:
+    <<: *default-logging
     container_name: immich_machine_learning
     image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}-openvino
     volumes:
@@ -45,6 +59,7 @@ services:
     restart: always
 
   redis:
+    <<: *default-logging
     container_name: immich_redis
     image: docker.io/valkey/valkey:9
     healthcheck:
@@ -52,6 +67,7 @@ services:
     restart: always
 
   database:
+    <<: *default-logging
     container_name: immich_postgres
     image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
     environment:
@@ -71,6 +87,7 @@ services:
     restart: always
 
   syncthing:
+    <<: *default-logging
     image: lscr.io/linuxserver/syncthing:v2.1.1-ls220
     container_name: syncthing
     volumes:
@@ -86,6 +103,7 @@ services:
   # Routes by hostname to the apps above (see ./caddy/Caddyfile). The direct
   # app ports (2283/8384) stay published as a cutover fallback.
   caddy:
+    <<: *default-logging
     container_name: caddy
     build: ./caddy
     env_file:
