@@ -1,0 +1,338 @@
+---
+# Recovery task: restore the VaultWarden vault from a previous backup.
+#
+# This is the counterpart to backup_vaultwarden.yaml. It is DESTRUCTIVE: it
+# replaces the live vaultwarden_data with the contents of a chosen backup, so
+# EVERY change made to the vault since that backup was taken is lost (new logins,
+# password edits, deleted/added items, attachments). Because of that it refuses
+# to run without an explicit confirmation (type RESTORE, or pass -e force=true).
+#
+# It accepts either kind of "previous backup" this repo produces:
+#   * an age-ENCRYPTED off-box archive from backup_vaultwarden.yaml
+#     (vault-<ts>.age) — requires the OFFLINE private key (-e age_identity_file=);
+#   * an unencrypted pre-upgrade SNAPSHOT directory from update_vaultwarden.yaml
+#     (vaultwarden_backups/<ts>_<ver>/data) — no key needed.
+# The mode is chosen by the backup_path extension (.age => encrypted).
+#
+# Reversible by default: before overwriting, it snapshots the CURRENT vault data
+# to vaultwarden_backups/pre-restore-<ts>/data, and if the restored vault fails
+# its /alive health check it AUTOMATICALLY rolls that pre-restore snapshot back
+# and fails loudly — so a bad restore is recoverable, not a second data loss.
+#
+# Self-contained, like backup_vaultwarden.yaml / update_vaultwarden.yaml.
+#
+# Usage:
+#   # restore an encrypted off-box archive (needs the offline private key):
+#   ansible-playbook ansible/recovery/recover_vaultwarden.yaml \
+#     -e backup_path=/mnt/pve/secure-storage/syncthing_share/vault_backups/vault-20260101-120000.age \
+#     -e age_identity_file=~/secrets/vaultwarden-age-key.txt
+#
+#   # restore an on-box pre-upgrade snapshot (no key needed):
+#   ansible-playbook ansible/recovery/recover_vaultwarden.yaml \
+#     -e backup_path=/mnt/pve/secure-storage/vaultwarden_backups/20260101-120000_1.32.0/data
+#
+#   # skip the interactive confirmation (e.g. for scripted DR drills):
+#   ansible-playbook ansible/recovery/recover_vaultwarden.yaml -e backup_path=... -e force=true
+#
+# Notes:
+#   * backup_path is a path on the PROXMOX HOST (not the controller). If the .age
+#     archive only exists on a USB drive / your laptop, copy it onto the box first
+#     (e.g. into the Syncthing folder) and point backup_path at that host path.
+#   * age_identity_file IS a CONTROLLER path (your laptop, where the offline key
+#     lives). It is copied to a transient 0600 file on the host only for the
+#     decrypt and is shredded immediately after — the private key is never left
+#     on the box, preserving the off-box theft protection.
+- name: Recover the VaultWarden vault from a previous backup
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep these in sync with 06/07_*vaultwarden*.yaml, update_vaultwarden.yaml
+    # and backup_vaultwarden.yaml (these magic values are duplicated, not shared).
+    container_id: 101
+    secure_storage_path: /mnt/pve/secure-storage
+    data_subdir: vaultwarden_data
+    data_owner: "101000:101000"   # unprivileged-LXC id-shift of the service uid 1000
+    vaultwarden_ip: "192.168.0.54"
+    rocket_port: 8000
+    backups_root: "{{ secure_storage_path }}/vaultwarden_backups"
+    staging_dir: "{{ backups_root }}/.restore-staging"
+    identity_tmp: /root/.vw-restore-identity   # transient host copy of the age key; shredded in `always`
+    keep_pre_restore: 5   # how many pre-restore-<ts> safety snapshots to retain
+    force: false
+    # backup_path is REQUIRED via -e: a host path to a vault-<ts>.age archive OR
+    #   to an unencrypted snapshot data/ directory.
+    # age_identity_file is REQUIRED via -e only when backup_path ends in .age.
+
+  tasks:
+    # --- Phase 1: validate inputs & preconditions ---------------------------
+    - name: Fail if backup_path was not provided
+      ansible.builtin.fail:
+        msg: "backup_path is required. Pass -e backup_path=<host path to a vault-*.age archive or an unencrypted snapshot data/ directory>."
+      when: backup_path is undefined or (backup_path | length == 0)
+
+    - name: Determine whether the backup is age-encrypted
+      ansible.builtin.set_fact:
+        backup_is_encrypted: "{{ backup_path is match('.*\\.age$') }}"
+
+    - name: Fail if an encrypted backup was given without an identity file
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} is age-encrypted but no age_identity_file was given. Pass -e age_identity_file=<controller path to the OFFLINE private key>."
+      when: backup_is_encrypted and (age_identity_file is undefined or (age_identity_file | length == 0))
+
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first — the vault data lives on the encrypted volume."
+      when: secure_mount_check.rc != 0
+
+    - name: Confirm the backup path exists on the host
+      ansible.builtin.stat:
+        path: "{{ backup_path }}"
+      register: backup_stat
+
+    - name: Fail if the backup path does not exist
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} does not exist on the host. backup_path must be a path on the Proxmox host (copy the archive onto the box first if it is only on a USB drive / your laptop)."
+      when: not backup_stat.stat.exists
+
+    - name: Fail if an unencrypted backup path is not a directory
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} is not a directory. For an unencrypted backup, point backup_path at a snapshot's data/ directory (e.g. {{ backups_root }}/<ts>_<ver>/data)."
+      when: not backup_is_encrypted and not backup_stat.stat.isdir
+
+    - name: Check the VaultWarden LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the VaultWarden LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Provision and deploy it first (06/07_*vaultwarden*.yaml)."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the VaultWarden LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Ensure age is installed on the host (encrypted backups only)
+      ansible.builtin.apt:
+        name: age
+        state: present
+        update_cache: yes
+      when: backup_is_encrypted
+
+    # --- Phase 2: stage + validate the backup (BEFORE any destructive step) --
+    # Decrypt/extract into a scratch dir first and sanity-check it. This way a
+    # bad path, wrong key, or non-vault archive fails with the live vault still
+    # untouched and the service still running — no downtime, nothing to undo.
+    - name: Stage and validate the backup, then restore it
+      block:
+        - name: Reset a clean staging directory
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: "{{ item }}"
+            mode: "0700"
+          loop:
+            - absent
+            - directory
+
+        - name: Copy the age identity to a transient host file (encrypted only)
+          ansible.builtin.copy:
+            src: "{{ age_identity_file }}"
+            dest: "{{ identity_tmp }}"
+            mode: "0600"
+          when: backup_is_encrypted
+
+        # Decrypt straight into staging; no plaintext tarball ever lands on disk.
+        - name: Decrypt and extract the encrypted archive into staging
+          ansible.builtin.shell:
+            cmd: "set -o pipefail && age -d -i {{ identity_tmp }} {{ backup_path | quote }} | tar xz -C {{ staging_dir }}"
+            executable: /bin/bash
+          register: decrypt
+          changed_when: decrypt.rc == 0
+          when: backup_is_encrypted
+
+        # cp -a preserves ownership from the snapshot (already 101000:101000).
+        - name: Copy the unencrypted snapshot into staging
+          ansible.builtin.command: "cp -a {{ backup_path }}/. {{ staging_dir }}/"
+          register: copy_snapshot
+          changed_when: copy_snapshot.rc == 0
+          when: not backup_is_encrypted
+
+        # A vault must have db.sqlite3 — guards against a wrong/empty/corrupt
+        # archive or a wrong key (age would have failed, but be explicit).
+        - name: Confirm the staged backup contains a vault database
+          ansible.builtin.stat:
+            path: "{{ staging_dir }}/db.sqlite3"
+          register: staged_db_stat
+
+        - name: Fail if the staged backup has no vault database
+          ansible.builtin.fail:
+            msg: "The staged backup has no db.sqlite3 — it does not look like a VaultWarden vault. Refusing to overwrite the live vault. (Wrong path, wrong key, or a corrupt/empty archive?)"
+          when: not staged_db_stat.stat.exists
+
+        # --- Phase 3: confirmation (last chance before destruction) ----------
+        - name: Confirm the destructive restore
+          ansible.builtin.pause:
+            prompt: |
+
+              ============================ DESTRUCTIVE RESTORE ============================
+              About to OVERWRITE the live VaultWarden vault on container {{ container_id }}:
+                from backup : {{ backup_path }}
+                into        : {{ secure_storage_path }}/{{ data_subdir }}
+
+              EVERY change made to the vault since this backup was taken WILL BE LOST.
+              (The current vault is first snapshotted to {{ backups_root }}/pre-restore-<ts>
+              and is rolled back automatically if the restore fails its health check.)
+
+              Type RESTORE to proceed, anything else to abort:
+          register: confirm
+          when: not (force | bool)
+
+        - name: Abort unless the restore was confirmed
+          ansible.builtin.fail:
+            msg: "Restore not confirmed (you did not type RESTORE). Aborting with the live vault untouched."
+          when: not (force | bool) and (confirm.user_input | default('') | trim) != 'RESTORE'
+
+        # --- Phase 4: stop, snapshot current, swap in the backup -------------
+        - name: Stop VaultWarden before swapping the data
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl stop vaultwarden"
+          register: stop_svc
+          changed_when: stop_svc.rc == 0
+
+        - name: Timestamp for the pre-restore safety snapshot
+          ansible.builtin.command: date +%Y%m%d-%H%M%S
+          register: ts_cmd
+          changed_when: false
+
+        - name: Compute the pre-restore snapshot path
+          ansible.builtin.set_fact:
+            pre_restore_dir: "{{ backups_root }}/pre-restore-{{ ts_cmd.stdout }}"
+
+        - name: Create the pre-restore snapshot directory
+          ansible.builtin.file:
+            path: "{{ pre_restore_dir }}"
+            state: directory
+            mode: "0700"
+
+        # cp -a preserves the 101000:101000 ownership so this snapshot is itself
+        # restorable (it is exactly the shape update_vaultwarden.yaml produces).
+        - name: Snapshot the CURRENT vault data (so the restore is reversible)
+          ansible.builtin.command: "cp -a {{ secure_storage_path }}/{{ data_subdir }} {{ pre_restore_dir }}/data"
+          register: pre_snap
+          changed_when: pre_snap.rc == 0
+
+        - name: Swap in the staged backup as the live vault data
+          ansible.builtin.command:
+            cmd: >-
+              bash -c '
+              set -euo pipefail;
+              rm -rf {{ secure_storage_path }}/{{ data_subdir }};
+              mkdir -p {{ secure_storage_path }}/{{ data_subdir }};
+              cp -a {{ staging_dir }}/. {{ secure_storage_path }}/{{ data_subdir }}/;
+              chown -R {{ data_owner }} {{ secure_storage_path }}/{{ data_subdir }}
+              '
+          register: swap
+          changed_when: swap.rc == 0
+
+        - name: Start VaultWarden on the restored vault
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          register: start_svc
+          changed_when: start_svc.rc == 0
+
+        # Health check from the controller (on the LAN) — catches a restored DB
+        # that the binary cannot open / migrate.
+        - name: Wait for VaultWarden to answer /alive on the restored vault
+          ansible.builtin.uri:
+            url: "http://{{ vaultwarden_ip }}:{{ rocket_port }}/alive"
+            status_code: 200
+          delegate_to: localhost
+          become: no
+          register: health
+          retries: 15
+          delay: 2
+          until: health.status == 200
+
+      rescue:
+        # If we never got as far as snapshotting/swapping (e.g. bad key, no
+        # confirmation), pre_restore_dir is unset and the live vault was never
+        # touched — just report. Otherwise roll the pre-restore snapshot back.
+        - name: Report the failure
+          ansible.builtin.debug:
+            msg: "Restore failed. {{ 'Rolling back the pre-restore snapshot from ' + pre_restore_dir if pre_restore_dir is defined else 'The live vault was never modified.' }}"
+
+        - name: Stop the (possibly broken) service before rollback
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl stop vaultwarden"
+          changed_when: false
+          failed_when: false
+          when: pre_restore_dir is defined
+
+        - name: Roll the pre-restore snapshot back to the live vault
+          ansible.builtin.command:
+            cmd: >-
+              bash -c '
+              set -euo pipefail;
+              rm -rf {{ secure_storage_path }}/{{ data_subdir }};
+              cp -a {{ pre_restore_dir }}/data {{ secure_storage_path }}/{{ data_subdir }};
+              chown -R {{ data_owner }} {{ secure_storage_path }}/{{ data_subdir }}
+              '
+          changed_when: true
+          when: pre_restore_dir is defined
+
+        - name: Restart VaultWarden on the rolled-back vault
+          ansible.builtin.command: "pct exec {{ container_id }} -- systemctl start vaultwarden"
+          changed_when: true
+          failed_when: false
+          when: pre_restore_dir is defined
+
+        - name: Fail the play after the restore attempt
+          ansible.builtin.fail:
+            msg: >-
+              VaultWarden restore from {{ backup_path }} FAILED.
+              {{ 'The pre-restore snapshot was rolled back (retained at ' + pre_restore_dir + ') and the previous vault restarted.' if pre_restore_dir is defined else 'The live vault was never modified.' }}
+              Investigate: pct exec {{ container_id }} -- journalctl -u vaultwarden -n 80
+
+      always:
+        # The transient key copy must never linger on the box — shred + remove it
+        # regardless of success/failure. Staging holds plaintext vault data, so
+        # clear it too.
+        - name: Shred and remove the transient age identity copy
+          ansible.builtin.command: "shred -u {{ identity_tmp }}"
+          changed_when: false
+          failed_when: false
+          when: backup_is_encrypted
+
+        - name: Remove the staging directory
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: absent
+
+    # --- Phase 5: success housekeeping + report -----------------------------
+    # Scoped to pre-restore-* so it never touches update_vaultwarden.yaml's
+    # <ts>_<ver> upgrade snapshots, the age recipient, or the staging dir. The
+    # just-created pre_restore_dir is the newest, so it always survives the prune.
+    - name: Prune old pre-restore snapshots (keep the most recent N)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c '
+          cd {{ backups_root }} && ls -1dt pre-restore-*/ 2>/dev/null | tail -n +{{ keep_pre_restore + 1 }} | xargs -r rm -rf
+          '
+      changed_when: false
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg:
+          - "VaultWarden restored from {{ backup_path }} and is answering /alive."
+          - "The vault as it was just before this restore is snapshotted at {{ pre_restore_dir }}/data — undo this restore by re-running with -e backup_path={{ pre_restore_dir }}/data."
+          - "Pre-restore snapshots are pruned to the {{ keep_pre_restore }} most recent."
