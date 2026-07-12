@@ -1,0 +1,186 @@
+---
+# Read-only update checker for the Docker application stack in LXC 100. Reports
+# which apps have a newer upstream version than what is deployed. Mutates
+# NOTHING — it never pulls, never restarts, never edits a file. Run it on demand
+# or on a cron, then act with update_docker_stack.yaml if something has drifted.
+#
+# Self-contained, in ansible/ root like unlock_storage.yaml / update_*.yaml.
+#
+# Where "deployed" comes from (authoritative, read live off the box, not the repo):
+#   * Immich: the IMMICH_VERSION line in the live, generate-once .env (the repo's
+#     .env.example does NOT track it — see update_docker_stack.yaml).
+#   * postgres/valkey/syncthing: the image tags in the deployed docker-compose.yml
+#     (update_docker_stack.yaml re-pushes that file every upgrade, so box == repo).
+#
+# Where "latest" comes from (fetched live from the box — outbound is fine):
+#   * Immich: the latest GitHub release tag.
+#   * postgres/valkey: NOT "latest postgres", but whatever Immich's own compose
+#     pins at that release tag — these images track Immich, so a bump should ride
+#     along with an Immich bump (matches the comment in docker-compose.yml).
+#   * syncthing: the full vX.Y.Z-lsNNN tag from the LinuxServer.io API (its
+#     `version` field is the exact tag to pin). The -lsNNN build number bumps
+#     when LinuxServer REBUILDS the image (updated base OS / s6 / security
+#     patches) even at the same Syncthing version, so we compare the WHOLE tag,
+#     not just the app version — those rebuilds carry real OS-level fixes.
+#   * caddy: pinned to the floating major `caddy:2` and built locally, so minor
+#     updates arrive on the next `--build`. Latest upstream is shown for awareness;
+#     only a new MAJOR (v3) needs a deliberate tag change.
+#
+# Comparison is plain string inequality (deployed != latest -> flag it), not
+# ordered semver: the human decides whether to upgrade, this just surfaces drift.
+#
+# Usage:
+#   ansible-playbook ansible/check_updates.yaml
+#
+# Requires LXC 100 to be running (run unlock_storage.yaml first). Read-only, so it
+# does NOT require the encrypted storage to be mounted and will not start the LXC.
+- name: Check for available updates to the Docker application stack (LXC 100)
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep in sync with 04/05_*docker*.yaml + update_docker_stack.yaml (duplicated).
+    container_id: 100
+    compose_dir: /opt/docker-stack
+    # GitHub requires a User-Agent; unauthenticated API is rate-limited to 60/hr/IP
+    # (ample for an occasional check). No token needed for public release metadata.
+    gh_headers:
+      Accept: application/vnd.github+json
+      User-Agent: proxmox-box-check-updates
+
+  tasks:
+    # --- Guard: the container must be up so we can read its deployed versions ---
+    - name: Check the Docker LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC is not running
+      ansible.builtin.fail:
+        msg: >-
+          Container {{ container_id }} is not running ({{ ct_status.stdout | default(ct_status.stderr) | trim }}).
+          Run unlock_storage.yaml first. This checker is read-only and will not start it.
+      when: "'status: running' not in ct_status.stdout"
+
+    # --- Read DEPLOYED versions off the box ----------------------------------
+    - name: Read the deployed Immich version from the live .env
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -lc \"grep -E '^IMMICH_VERSION=' {{ compose_dir }}/.env | cut -d= -f2-\""
+      register: dep_immich
+      changed_when: false
+
+    - name: Read the deployed docker-compose.yml
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- cat {{ compose_dir }}/docker-compose.yml"
+      register: dep_compose
+      changed_when: false
+
+    - name: Extract the deployed image tags from the compose file
+      ansible.builtin.set_fact:
+        deployed:
+          immich: "{{ dep_immich.stdout | trim }}"
+          postgres: "{{ dep_compose.stdout | regex_search('immich-app/postgres:(\\S+)', '\\1') | first }}"
+          valkey: "{{ dep_compose.stdout | regex_search('valkey/valkey:(\\S+)', '\\1') | first }}"
+          syncthing: "{{ dep_compose.stdout | regex_search('linuxserver/syncthing:(\\S+)', '\\1') | first }}"
+
+    # --- Fetch LATEST versions from upstream (runs on the box) ----------------
+    - name: Fetch the latest Immich release
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/immich-app/immich/releases/latest
+        headers: "{{ gh_headers }}"
+        return_content: yes
+      register: immich_release
+      changed_when: false
+
+    - name: Fetch Immich's own compose at that release tag (for the matching postgres/valkey pins)
+      ansible.builtin.uri:
+        url: "https://raw.githubusercontent.com/immich-app/immich/{{ immich_release.json.tag_name }}/docker/docker-compose.yml"
+        return_content: yes
+      register: immich_upstream_compose
+      changed_when: false
+
+    # LinuxServer.io's API exposes the full vX.Y.Z-lsNNN tag (the exact thing to
+    # pin) in one field — no GitHub token, no registry tag-list sorting.
+    - name: Fetch the latest Syncthing image tag from the LinuxServer.io API
+      ansible.builtin.uri:
+        url: https://api.linuxserver.io/api/v1/images?include_deprecated=false
+        return_content: yes
+      register: lsio_images
+      changed_when: false
+
+    - name: Fetch the latest Caddy release
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/caddyserver/caddy/releases/latest
+        headers: "{{ gh_headers }}"
+        return_content: yes
+      register: caddy_release
+      changed_when: false
+
+    - name: Resolve the latest versions
+      ansible.builtin.set_fact:
+        latest:
+          immich: "{{ immich_release.json.tag_name }}"
+          postgres: "{{ immich_upstream_compose.content | regex_search('immich-app/postgres:(\\S+)', '\\1') | first }}"
+          valkey: "{{ immich_upstream_compose.content | regex_search('valkey/valkey:(\\S+)', '\\1') | first }}"
+          syncthing: "{{ lsio_images.json.data.repositories.linuxserver | selectattr('name', 'equalto', 'syncthing') | map(attribute='version') | first }}"
+          caddy: "{{ caddy_release.json.tag_name }}"
+
+    # --- Compare (string inequality) + report --------------------------------
+    - name: Build the drift report
+      ansible.builtin.set_fact:
+        components:
+          - name: immich
+            deployed: "{{ deployed.immich }}"
+            latest: "{{ latest.immich }}"
+            drift: "{{ deployed.immich != latest.immich }}"
+            note: ""
+          - name: postgres
+            deployed: "{{ deployed.postgres }}"
+            latest: "{{ latest.postgres }}"
+            drift: "{{ deployed.postgres != latest.postgres }}"
+            note: "tracks Immich — bump alongside Immich"
+          - name: valkey
+            deployed: "{{ deployed.valkey }}"
+            latest: "{{ latest.valkey }}"
+            drift: "{{ deployed.valkey != latest.valkey }}"
+            note: "tracks Immich — bump alongside Immich"
+          - name: syncthing
+            deployed: "{{ deployed.syncthing }}"
+            latest: "{{ latest.syncthing }}"
+            drift: "{{ deployed.syncthing != latest.syncthing }}"
+            note: "-lsNNN bumps carry base-OS/security rebuilds — pin this exact tag"
+          - name: caddy
+            deployed: "caddy:2 (floating, built locally)"
+            latest: "{{ latest.caddy }}"
+            drift: false
+            note: "minors arrive on next --build; only a new MAJOR needs a tag change"
+
+    # debug prints a LIST with one element per line, so build the table as a
+    # list of fixed-width rows (a single folded string would collapse to one line).
+    - name: Build the report rows
+      ansible.builtin.set_fact:
+        report_lines: "{{ report_lines | default([report_header]) + [report_row] }}"
+      loop: "{{ components }}"
+      vars:
+        report_header: "{{ '%-11s %-36s %-26s %s' | format('COMPONENT', 'DEPLOYED', 'LATEST', 'STATUS') }}"
+        report_status: "{{ ('UPDATE AVAILABLE' if (item.drift | bool) else 'up to date') ~ (('  (' ~ item.note ~ ')') if item.note else '') }}"
+        report_row: "{{ '%-11s %-36s %-26s %s' | format(item.name, item.deployed, item.latest, report_status) }}"
+
+    - name: Show the update report
+      ansible.builtin.debug:
+        msg: "{{ report_lines }}"
+
+    - name: Summarise what needs attention
+      ansible.builtin.debug:
+        msg: >-
+          {%- set drifted = components | selectattr('drift', 'equalto', true) | map(attribute='name') | list -%}
+          {%- if drifted | length > 0 -%}
+          Updates available for: {{ drifted | join(', ') }}.
+          Apply with: ansible-playbook ansible/update_docker_stack.yaml{{ ' -e immich_version=' ~ latest.immich if 'immich' in drifted else '' }}
+          (for postgres/valkey/syncthing, bump the tag in ansible/resources/docker-compose.yml first).
+          {%- else -%}
+          Everything is up to date.
+          {%- endif -%}
