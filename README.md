@@ -65,6 +65,15 @@ ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
 #   https://immich.<base-domain>  and  https://syncthing.<base-domain>  with a valid Let's Encrypt cert.
 # Check issuance/renewal: pct exec 100 -- docker compose -f /opt/docker-stack/docker-compose.yml logs caddy
 #
+# Configure Syncthing folders (in the web UI at https://syncthing.<base-domain>):
+# user-synced data lives on the encrypted volume at /mnt/storage/syncthing_share,
+# bind-mounted into the container as /data. Set every sync Folder Path UNDER /data
+# (NOT /config, which is Syncthing's own state). Canonical paths:
+#   /data/personal       -> /mnt/pve/secure-storage/syncthing_share/personal      (your files)
+#   /data/vault_backups  -> /mnt/pve/secure-storage/syncthing_share/vault_backups (VaultWarden .age archives)
+# Create the folder in the UI first so Syncthing owns it (it writes a .stfolder
+# marker); the vault-backup playbook below then drops files into it as host root.
+#
 # Optional once the wildcard cert is issued: reuse it for the Proxmox web UI itself
 # (replaces its self-signed cert) — ansible/update_proxmox_cert.yaml. NOTE the
 # wildcard does NOT cover the apex/bare IP, so browse Proxmox at a SUBDOMAIN
@@ -111,6 +120,58 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 # upgrade, not disk loss; off-box backup of the photo library/DB is tracked as
 # P1 in BACKLOG.md.)
 
+# Remote access (VPN) — reach the LAN services from outside the home
+#
+# Self-hosted WireGuard in its own LXC (id 102), acting as a subnet router for
+# 192.168.0.0/24 — so a phone/laptop with WireGuard reaches Immich/Syncthing
+# (192.168.0.53), VaultWarden (192.168.0.54) and the Proxmox UI as if on the LAN.
+# This is the ONE deliberate inbound exposure on the box (see the threat model in
+# CLAUDE.md): a single, port-scan-silent WireGuard UDP port.
+#
+# Because the ISP uses CGNAT (no public IPv4), the tunnel runs over IPv6: the LXC
+# gets a global v6 address (GUA) via SLAAC, and the tunnel is reached at that
+# address. Inside the tunnel everything is IPv4 to the LAN. Caveat: a client can
+# only connect when ITS network has IPv6 (cellular: almost always; IPv4-only
+# Wi-Fi: no).
+#
+# Unlike 100/101, this LXC is onboot=1 and keeps its keys on the UNENCRYPTED
+# rootfs, so it autostarts after any reboot WITHOUT the manual LUKS unlock. That
+# is intentional: if family power-cycles the box while you are away, the VPN comes
+# back on its own and you can VPN in to run unlock_storage.yaml REMOTELY (and any
+# other admin). Trade-off: a stolen box leaks the WG keys + peer list (low value
+# vs. the still-encrypted photos/vault; the keys are cheap to regenerate).
+
+# Provision the WireGuard LXC (id 102). Loads the wireguard kernel module on the
+# host, then creates an unprivileged, no-nesting, onboot=1 container with a static
+# v4 IP (.55) and ip6=auto. No encrypted-storage dependency.
+ansible-playbook ansible/bootstrap/09_provision_wireguard_lxc.yaml
+
+# Deploy WireGuard into LXC 102. Installs wireguard-tools/iptables/qrencode,
+# generates the server keypair + wg0.conf (with MASQUERADE so LAN hosts can reply
+# to VPN clients), enables wg-quick@wg0, and health-checks the interface + that
+# the container has a global IPv6 address.
+ansible-playbook ansible/bootstrap/10_deploy_wireguard.yaml
+
+# Manual prerequisites (outside Ansible, like the LAN-DNS step):
+#   1. On the ROUTER: open an inbound IPv6 firewall pinhole for udp/51820 to the
+#      LXC's GUA. There is NO port-forward/DNAT — IPv6 is not NATed.
+#   2. Confirm the ISP delegates a routable IPv6 prefix (the deploy play warns if
+#      the LXC has no GUA). If it does not, the v6 path cannot work and the
+#      documented fallback is a relay (Tailscale / a cheap VPS).
+
+# Point vpn.<base-domain>'s AAAA at the LXC's GUA (reuses the OVH creds from
+# caddy.env). The prefix is treated as static, so run this ONCE; if a future ISP
+# change makes the prefix rotate, put it on a cron to keep the record fresh.
+ansible-playbook ansible/update_wireguard_ddns.yaml
+
+# Enrol a device (prints the client config + a scannable QR code; hot-reloads the
+# running interface so existing peers are not dropped). peer_name + wg_endpoint
+# are required; an IP is auto-allocated.
+ansible-playbook ansible/add_wireguard_peer.yaml -e peer_name=phone -e wg_endpoint=vpn.<base-domain>
+
+# Revoke a device (e.g. lost phone): strips its peer block and drops it live.
+ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
+
 # Backups
 #
 # LUKS only protects against disk theft — NOT deletion, corruption, or a bad
@@ -142,8 +203,9 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #     by ansible/backup_vaultwarden.yaml. It takes a consistent snapshot (briefly
 #     stops the service), encrypts it with `age`, and drops a vault-<ts>.age archive
 #     into a Syncthing-shared folder so it rides the same personal-machine -> USB
-#     pipeline. Pass the host path of that shared folder via -e:
-#       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder>
+#     pipeline. Pass the host path of that shared folder via -e (the canonical one
+#     set up during deploy is syncthing_share/vault_backups):
+#       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups
 #       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_backups=14
 #     Requires the encrypted storage mounted (run unlock_storage.yaml first).
 #
@@ -163,20 +225,32 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #     so use the ABSOLUTE ansible-playbook path — find it with `which ansible-playbook`.
 #
 #       LINUX — add with `crontab -e`:
-#         0 12 * * 1 cd /path/to/proxmox-box && /usr/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder> >> "$HOME/proxmox-backup.log" 2>&1
+#         0 12 * * 1 cd /path/to/proxmox-box && /usr/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
 #
 #       macOS — add with `crontab -e` (cron still works; homebrew installs
 #       ansible-playbook under /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel):
-#         0 12 * * 1 cd /path/to/proxmox-box && /opt/homebrew/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder> >> "$HOME/proxmox-backup.log" 2>&1
+#         0 12 * * 1 cd /path/to/proxmox-box && /opt/homebrew/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
 #       macOS caveats: the Mac must be AWAKE at 12:00 Monday (cron does not wake it);
 #       if runs fail silently, grant `cron` Full Disk Access in System Settings >
 #       Privacy & Security. To survive sleep, prefer a launchd LaunchAgent with a
 #       StartCalendarInterval of { Weekday = 1; Hour = 12; Minute = 0; } instead of cron.
 #
-#     RESTORE (needs the offline private key):
-#       age -d -i <private-key-file> vault-<ts>.age | tar xz -C <restore-dir>
-#     then stop container 101, replace /mnt/pve/secure-storage/vaultwarden_data with
-#     the restored tree, `chown -R 101000:101000` it, and start 101.
+#     RESTORE (automated — ansible/recovery/recover_vaultwarden.yaml): this is
+#     DESTRUCTIVE (the live vault is overwritten and every change since the backup
+#     is lost), so it asks for confirmation (type RESTORE) before swapping data. It
+#     stops container 101, snapshots the CURRENT vault to vaultwarden_backups/
+#     pre-restore-<ts> first (so the restore itself is reversible), swaps in the
+#     backup, restarts, and health-checks /alive — auto-rolling the pre-restore
+#     snapshot back if the restored vault fails to come up. backup_path is a HOST
+#     path; for an encrypted archive also pass the OFFLINE private key (a controller
+#     path — it is copied to a transient 0600 file on the box and shredded after):
+#       ansible-playbook ansible/recovery/recover_vaultwarden.yaml \
+#         -e backup_path=/mnt/pve/secure-storage/syncthing_share/vault_backups/vault-<ts>.age \
+#         -e age_identity_file=~/secrets/vaultwarden-age-key.txt
+#     It also restores an unencrypted pre-upgrade snapshot from update_vaultwarden.yaml
+#     (no key needed): -e backup_path=/mnt/pve/secure-storage/vaultwarden_backups/<ts>_<ver>/data
+#     If the .age archive is only on a USB drive / your laptop, copy it onto the box
+#     first (e.g. into the Syncthing folder) and point backup_path at that host path.
 #
 #   * Immich database (optional, recommended): the DB holds the CURATED metadata —
 #     albums, manual tags, named people (faces are re-detected on restore, but the
@@ -204,7 +278,7 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #   * Host + guest OS updates (deliberate, owner-initiated full upgrade):
 #       ansible-playbook ansible/update_proxmox.yaml
 #     apt update + dist-upgrade on the Proxmox host AND inside the running LXC
-#     guests (100/101; this also bumps docker-ce in 100). It does NOT reboot —
+#     guests (100/101/102; this also bumps docker-ce in 100). It does NOT reboot —
 #     it only reports if a reboot is pending (a reboot needs a manual LUKS
 #     unlock afterwards). Run it on whatever cadence you like.
 #
@@ -216,9 +290,26 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #       Verify: sudo unattended-upgrade --dry-run --debug
 #               systemctl status apt-daily-upgrade.timer
 #
+#   * Check for available Docker-stack updates (read-only — mutates nothing):
+#       ansible-playbook ansible/check_updates.yaml
+#     Reports, as a table, which apps in LXC 100 (Immich, postgres, valkey,
+#     syncthing, caddy) have a newer upstream version than what is deployed.
+#     Reads the DEPLOYED versions live off the box (Immich from the live .env,
+#     the rest from the deployed docker-compose.yml) and fetches LATEST from
+#     upstream — Immich/caddy from their GitHub releases, syncthing's full
+#     vX.Y.Z-lsNNN tag from the LinuxServer.io API (so a -lsNNN-only rebuild,
+#     which carries base-OS/security fixes, is caught — not just app-version
+#     bumps), and the postgres/valkey targets from Immich's OWN compose at its
+#     latest release tag (those images track Immich, so they bump alongside it).
+#     caddy is a floating major-2 build, so only a new MAJOR is flagged. Requires LXC 100
+#     running (unlock_storage.yaml first); does NOT need storage mounted and
+#     never starts the container. Good cron candidate. Then apply with
+#     update_docker_stack.yaml below.
+#
 #   * Docker application stack upgrades (Immich, Syncthing, Caddy, Postgres, Valkey):
 #       ansible-playbook ansible/update_docker_stack.yaml                          # pull repo-pinned tags + recreate
-#       ansible-playbook ansible/update_docker_stack.yaml -e immich_version=v2.8.0 # also bump Immich
+#       ansible-playbook ansible/update_docker_stack.yaml -e immich_version=v2.8.0 \
+#         -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/immich_db_backups   # snapshot+encrypt DB, then bump
 #     For Syncthing/Caddy/Postgres/Valkey: bump the tag in
 #     ansible/resources/docker-compose.yml, then run the playbook (it re-pushes
 #     the compose file and `docker compose pull && up -d`). For Immich the version
@@ -226,8 +317,24 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #     NOT propagate — pass -e immich_version=vX.Y.Z to rewrite it in place. Always
 #     check the upstream Immich release notes (and bump the postgres/valkey tags in
 #     docker-compose.yml to match) before a major bump.
+#     SAFETY: passing -e immich_version= REQUIRES -e syncthing_drop_dir= and first
+#     takes a logical pg_dumpall of the Immich DB, age-ENCRYPTS it, and drops it
+#     into that Syncthing-shared folder (so it auto-syncs off-box, like the vault
+#     backup); the bump aborts if the dump fails. This guards the IRREVERSIBLE
+#     DB migration an Immich major can run (e.g. 2.x -> 3.0 pgvecto.rs ->
+#     VectorChord). It does NOT auto-roll back; the success output prints the
+#     manual restore. First run prints an age PRIVATE key ONCE — store it OFFLINE
+#     (decrypts every Immich DB dump; restore: age -d -i <key> ... | gunzip | psql).
+#     Create the Syncthing folder in the UI first so Syncthing owns it.
 #
 #   * VaultWarden upgrades: ansible/update_vaultwarden.yaml (see above).
+#
+#   * VPN peers + endpoint DNS (see "Remote access (VPN)" above):
+#       ansible-playbook ansible/add_wireguard_peer.yaml -e peer_name=<name> -e wg_endpoint=vpn.<base-domain>
+#       ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=<name>
+#       ansible-playbook ansible/update_wireguard_ddns.yaml   # refresh the AAAA; cron only if the v6 prefix rotates
+#     The WireGuard LXC (102) autostarts on boot (onboot=1) and is independent of
+#     the LUKS unlock, so nothing VPN-related needs running after a reboot.
 #
 #   * Trusted HTTPS for the Proxmox web UI (reuse Caddy's wildcard cert):
 #       ansible-playbook ansible/update_proxmox_cert.yaml
@@ -245,6 +352,14 @@ ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 #     hostnames) make that DNS name resolve to the PROXMOX HOST's IP on your LAN
 #     — NOT the docker LXC (192.168.0.53). Browsing by IP or by the bare apex will
 #     still show a name-mismatch warning; that is expected.
+#
+#     Switching from the apex to the subdomain is PURELY a DNS + browser-URL
+#     change — it is low-risk and trivially reversible (delete the DNS record to
+#     revert). Do NOT rename the PVE node hostname/FQDN to match: the node's
+#     internal identity (its /etc/pve/nodes/<name> dir, internal pve-ssl cert,
+#     /etc/hosts self-mapping for quorum) is unrelated to the URL you browse to,
+#     and renaming it is the genuinely risky operation. Leave it as-is. Just add
+#     the subdomain DNS record and browse there; nothing inside Proxmox changes.
 #
 #     Caddy auto-renews (~every 60 days) and the copy installed here is a
 #     snapshot, so RE-RUN this periodically to refresh it (re-runs are no-ops

@@ -1,0 +1,139 @@
+---
+# Enrol a new WireGuard client (recurrent operational tool).
+#
+#   ansible-playbook ansible/add_wireguard_peer.yaml \
+#       -e peer_name=phone -e wg_endpoint=vpn.<base-domain>
+#
+# Optional: -e peer_ip=10.13.13.7   (otherwise the next free address is allocated)
+#           -e wg_client_dns=192.168.0.1   (so the client can resolve *.base-domain)
+#
+# Idempotent: if a peer with this name already exists, it re-displays the stored
+# config + QR instead of creating a duplicate. Hot-reloads the running interface
+# with `wg syncconf` so existing tunnels are NOT dropped.
+- name: Add a WireGuard peer
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep in sync with 09/10_*wireguard*.yaml.
+    container_id: 102
+    wg_interface: wg0
+    wg_listen_port: 51820
+    wg_conf: /etc/wireguard/wg0.conf
+    wg_server_pub: /etc/wireguard/server.pub
+    clients_dir: /etc/wireguard/clients
+    # What the client routes through the tunnel (split tunnel: LAN only).
+    allowed_ips: "192.168.0.0/24"
+    # Optional DNS the client uses while connected (empty = leave unset).
+    wg_client_dns: ""
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - peer_name is defined and peer_name | length > 0
+          - peer_name is match('^[A-Za-z0-9_-]+$')
+          - wg_endpoint is defined and wg_endpoint | length > 0
+        fail_msg: "Required: -e peer_name=<name> (letters/digits/-/_ only) and -e wg_endpoint=<host-or-ddns>. Optional: -e peer_ip=, -e wg_client_dns=."
+
+    - name: Check the WireGuard LXC is running
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the WireGuard LXC is not running
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} is not running. Run 09/10_*wireguard*.yaml first (it normally autostarts on boot)."
+      when: "'status: running' not in ct_status.stdout"
+
+    - name: Check whether this peer already exists
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- grep -qxF '# {{ peer_name }}' {{ wg_conf }}"
+      register: peer_check
+      changed_when: false
+      failed_when: false
+
+    # --- Create the peer (only when it does not already exist) ---------------
+    # All of allocation/keygen/append/reload is one in-container script so the
+    # client private key never transits the controller. The client .conf is
+    # persisted under clients/ (CT rootfs) so it can be re-displayed later.
+    - name: Create the peer and write its client config
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          umask 077;
+          mkdir -p {{ clients_dir }};
+          if [ -n "{{ peer_ip | default("") }}" ]; then
+            ip="{{ peer_ip }}";
+          else
+            last=$(grep -oE "10\.13\.13\.[0-9]+" {{ wg_conf }} | awk -F. "{print \$4}" | sort -n | tail -n1);
+            ip="10.13.13.$(( ${last:-1} + 1 ))";
+          fi;
+          oct=$(echo "$ip" | awk -F. "{print \$4}");
+          if [ "$oct" -ge 255 ] || [ "$oct" -le 1 ]; then echo "no free client IP (got $ip)" >&2; exit 1; fi;
+          priv=$(wg genkey);
+          pub=$(printf "%s" "$priv" | wg pubkey);
+          serverpub=$(cat {{ wg_server_pub }});
+          {
+            echo "";
+            echo "# {{ peer_name }}";
+            echo "[Peer]";
+            echo "PublicKey = $pub";
+            echo "AllowedIPs = $ip/32";
+          } >> {{ wg_conf }};
+          wg syncconf {{ wg_interface }} <(wg-quick strip {{ wg_interface }});
+          conf={{ clients_dir }}/{{ peer_name }}.conf;
+          {
+            echo "[Interface]";
+            echo "PrivateKey = $priv";
+            echo "Address = $ip/32";
+            if [ -n "{{ wg_client_dns }}" ]; then echo "DNS = {{ wg_client_dns }}"; fi;
+            echo "";
+            echo "[Peer]";
+            echo "PublicKey = $serverpub";
+            echo "Endpoint = {{ wg_endpoint }}:{{ wg_listen_port }}";
+            echo "AllowedIPs = {{ allowed_ips }}";
+            echo "PersistentKeepalive = 25";
+          } > "$conf";
+          chmod 600 "$conf"
+          '
+      when: peer_check.rc != 0
+      register: peer_create
+      changed_when: peer_create.rc == 0
+
+    - name: Report that the peer already existed
+      ansible.builtin.debug:
+        msg: "Peer '{{ peer_name }}' already exists — re-displaying its stored config (no change). To rotate it, remove_wireguard_peer.yaml then re-add."
+      when: peer_check.rc == 0
+
+    # --- Display the client config + QR (whether new or pre-existing) ---------
+    - name: Read the client config
+      ansible.builtin.command: "pct exec {{ container_id }} -- cat {{ clients_dir }}/{{ peer_name }}.conf"
+      register: client_conf
+      changed_when: false
+
+    - name: Render the client config as a scannable QR code
+      ansible.builtin.command: "pct exec {{ container_id }} -- bash -c 'qrencode -t ansiutf8 < {{ clients_dir }}/{{ peer_name }}.conf'"
+      register: client_qr
+      changed_when: false
+      failed_when: false
+
+    - name: Show the client config (import this on the device)
+      ansible.builtin.debug:
+        msg: "{{ client_conf.stdout_lines }}"
+
+    - name: Show the QR code (scan it from the WireGuard mobile app)
+      ansible.builtin.debug:
+        msg: "{{ client_qr.stdout_lines }}"
+      when: client_qr.rc == 0
+
+    - name: Reminders
+      ansible.builtin.debug:
+        msg:
+          - "Peer '{{ peer_name }}' is live (wg syncconf applied — existing tunnels were not dropped)."
+          - "The client config + private key are stored at {{ clients_dir }}/{{ peer_name }}.conf inside CT {{ container_id }} (re-run this playbook to re-display)."
+          - "Endpoint is {{ wg_endpoint }}:{{ wg_listen_port }} — ensure the router's inbound IPv6 pinhole for udp/{{ wg_listen_port }} is open and the AAAA is current (update_wireguard_ddns.yaml)."

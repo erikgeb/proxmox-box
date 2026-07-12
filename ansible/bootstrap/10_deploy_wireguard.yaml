@@ -1,0 +1,231 @@
+---
+- name: Deploy WireGuard into the VPN LXC
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Must match 09_provision_wireguard_lxc.yaml / the peer + ddns playbooks
+    # (these magic values are duplicated, not shared — keep them in sync).
+    container_id: 102
+    # WireGuard server settings.
+    wg_interface: wg0
+    wg_listen_port: 51820
+    # The VPN client subnet (carried inside the tunnel). Server takes .1.
+    wg_subnet: "10.13.13.0/24"
+    wg_server_ip: "10.13.13.1"
+    # The container's LAN egress interface — MASQUERADE happens here so LAN hosts
+    # (whose default gateway is the router, not this box) can reply to VPN clients.
+    wg_egress_if: eth0
+    # All config + keys live on the CT rootfs (unencrypted) — see 09 for the
+    # availability-vs-at-rest-encryption rationale.
+    wg_conf_dir: /etc/wireguard
+    wg_conf: /etc/wireguard/wg0.conf
+    wg_server_key: /etc/wireguard/server.key
+    wg_server_pub: /etc/wireguard/server.pub
+
+  tasks:
+    # --- Phase 1: guards -----------------------------------------------------
+    # No secure-storage mount guard: this container is intentionally independent
+    # of the encrypted volume (config is on its own rootfs).
+    - name: Check the WireGuard LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the WireGuard LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 09_provision_wireguard_lxc.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the WireGuard LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Wait for the container to be reachable via pct exec
+      ansible.builtin.command: "pct exec {{ container_id }} -- true"
+      register: ct_ready
+      until: ct_ready.rc == 0
+      retries: 10
+      delay: 2
+      changed_when: false
+
+    # --- Phase 2: packages ---------------------------------------------------
+    # Install wireguard-tools (wg / wg-quick) + iptables (nft-backed shims that
+    # wg-quick's PostUp rules expect) + qrencode (for add_wireguard_peer.yaml's
+    # terminal QR). Do NOT install the `wireguard` metapackage — it pulls DKMS and
+    # would try to build against absent kernel headers; the kernel module is
+    # provided by the host (loaded in 09).
+    - name: Check whether wireguard-tools is installed in the container
+      ansible.builtin.command: "pct exec {{ container_id }} -- command -v wg"
+      register: wg_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Install wireguard-tools, iptables and qrencode in the container
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          export DEBIAN_FRONTEND=noninteractive;
+          apt-get update;
+          apt-get install -y wireguard-tools iptables qrencode
+          '
+      when: wg_probe.rc != 0
+      register: wg_install
+      changed_when: "'Setting up' in wg_install.stdout"
+
+    # --- Phase 3: forwarding + stable IPv6 ----------------------------------
+    # net.ipv4.ip_forward is namespaced, so it is set INSIDE the container. wg-quick
+    # will not flip it for us; a sysctl.d drop-in makes it persistent + reconcilable.
+    # use_tempaddr=0 disables IPv6 privacy/temporary addresses so the container keeps
+    # a single STABLE global address — the DDNS endpoint must not chase a rotating
+    # privacy address. (These are per-netns sysctls, settable from inside the CT.)
+    - name: Configure forwarding + disable IPv6 temporary addresses in the container
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          {
+          echo "net.ipv4.ip_forward = 1";
+          echo "net.ipv6.conf.all.use_tempaddr = 0";
+          echo "net.ipv6.conf.default.use_tempaddr = 0";
+          echo "net.ipv6.conf.{{ wg_egress_if }}.use_tempaddr = 0";
+          } > /etc/sysctl.d/99-wireguard-forward.conf;
+          sysctl -q -w net.ipv4.ip_forward=1;
+          sysctl -q -w net.ipv6.conf.all.use_tempaddr=0 || true;
+          sysctl -q -w net.ipv6.conf.{{ wg_egress_if }}.use_tempaddr=0 || true
+          '
+      register: wg_sysctl
+      changed_when: wg_sysctl.rc == 0
+
+    # --- Phase 4: server keypair (generate-once) -----------------------------
+    # Generated ONCE and never rotated — rotating the server key invalidates every
+    # enrolled peer. Stored on the CT rootfs (unencrypted at rest; see 09).
+    - name: Check whether the server key already exists
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ wg_server_key }}"
+      register: wg_key_check
+      changed_when: false
+      failed_when: false
+
+    - name: Generate the WireGuard server keypair (first deploy only)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          umask 077;
+          mkdir -p {{ wg_conf_dir }};
+          wg genkey | tee {{ wg_server_key }} | wg pubkey > {{ wg_server_pub }};
+          chmod 600 {{ wg_server_key }} {{ wg_server_pub }}
+          '
+      when: wg_key_check.rc != 0
+      register: wg_keygen
+      changed_when: wg_keygen.rc == 0
+
+    # --- Phase 5: wg0.conf (generate-once) -----------------------------------
+    # Built in-container via a heredoc so the server private key never transits the
+    # controller. Generate-once: peers are appended later by add_wireguard_peer.yaml,
+    # so we must NOT clobber an existing conf (that would wipe enrolled peers).
+    # The two FORWARD rules explicitly ACCEPT the tunnel<->LAN forward path (Debian's
+    # default / any firewall may DROP forwarded traffic); MASQUERADE on the LAN
+    # egress makes VPN traffic appear to come from this box (.55) so LAN hosts reply
+    # to it directly — at the cost of services seeing all VPN clients as .55.
+    - name: Check whether wg0.conf already exists
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ wg_conf }}"
+      register: wg_conf_check
+      changed_when: false
+      failed_when: false
+
+    # Built with an echo-group (NOT a heredoc): this cmd is a folded YAML scalar,
+    # so newlines collapse to spaces — a heredoc would be flattened and break. Each
+    # statement is `;`-terminated, which survives folding.
+    - name: Write wg0.conf with the server interface + NAT rules (first deploy only)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          umask 077;
+          key=$(cat {{ wg_server_key }});
+          {
+          echo "[Interface]";
+          echo "Address = {{ wg_server_ip }}/24";
+          echo "ListenPort = {{ wg_listen_port }}";
+          echo "PrivateKey = $key";
+          echo "# MTU = 1380   # uncomment if large transfers stall over small-PMTU links";
+          echo "PostUp   = iptables -A FORWARD -i %i -o {{ wg_egress_if }} -j ACCEPT";
+          echo "PostUp   = iptables -A FORWARD -i {{ wg_egress_if }} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT";
+          echo "PostUp   = iptables -t nat -A POSTROUTING -s {{ wg_subnet }} -o {{ wg_egress_if }} -j MASQUERADE";
+          echo "PostDown = iptables -D FORWARD -i %i -o {{ wg_egress_if }} -j ACCEPT";
+          echo "PostDown = iptables -D FORWARD -i {{ wg_egress_if }} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT";
+          echo "PostDown = iptables -t nat -D POSTROUTING -s {{ wg_subnet }} -o {{ wg_egress_if }} -j MASQUERADE";
+          } > {{ wg_conf }};
+          chmod 600 {{ wg_conf }}
+          '
+      when: wg_conf_check.rc != 0
+      register: wg_conf_write
+      changed_when: wg_conf_write.rc == 0
+
+    # --- Phase 6: enable + start --------------------------------------------
+    # enable --now is idempotent. If the conf changed (or peers were added by the
+    # peer playbook) a reload happens there via `wg syncconf`; here we just ensure
+    # the service is enabled and up.
+    - name: Enable and start wg-quick@wg0
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          systemctl enable wg-quick@{{ wg_interface }};
+          systemctl restart wg-quick@{{ wg_interface }}
+          '
+      when: wg_conf_write is changed or wg_keygen is changed
+      register: wg_svc
+      changed_when: wg_svc.rc == 0
+
+    - name: Ensure wg-quick@wg0 is enabled and running (idempotent)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          systemctl enable wg-quick@{{ wg_interface }};
+          systemctl is-active --quiet wg-quick@{{ wg_interface }} || systemctl start wg-quick@{{ wg_interface }}
+          '
+      register: wg_svc_ensure
+      changed_when: false
+
+    # --- Phase 7: health checks ---------------------------------------------
+    - name: Verify the WireGuard interface is up
+      ansible.builtin.command: "pct exec {{ container_id }} -- wg show {{ wg_interface }}"
+      register: wg_show
+      changed_when: false
+      failed_when: wg_show.rc != 0
+
+    # Skip any temporary/privacy address (grep -v temporary) so we report the
+    # stable global address. Greps only — no awk $fields — so it is safe inside
+    # the double-quoted bash -c (where $ would otherwise expand).
+    - name: Read the container's stable global IPv6 address (the public endpoint)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c
+          "ip -6 addr show dev {{ wg_egress_if }} scope global | grep -v temporary | grep -oE '([0-9a-f]{1,4}:){2,}[0-9a-f:]+' | grep -v '^fe80' | head -n1"
+      register: wg_gua
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if the container has no global IPv6 address
+      ansible.builtin.debug:
+        msg: "WARNING: container {{ container_id }} has no global IPv6 address on {{ wg_egress_if }}. The endpoint is unreachable over IPv6 — confirm the ISP delegates a routable v6 prefix (this box uses CGNAT, so there is no public IPv4 fallback). See the Remote access section of the README."
+      when: wg_gua.stdout | trim | length == 0
+
+    - name: Report deployment result
+      ansible.builtin.debug:
+        msg:
+          - "WireGuard deployed in container {{ container_id }} (kernel module, no nesting). Interface {{ wg_interface }} is up on {{ wg_server_ip }}, ListenPort {{ wg_listen_port }} (dual-stack)."
+          - "Container global IPv6 (endpoint target): {{ wg_gua.stdout | trim if (wg_gua.stdout | trim | length > 0) else 'NONE — see warning above' }}"
+          - "Next steps (manual / other playbooks):"
+          - "  1. On the router: open an inbound IPv6 firewall pinhole for udp/{{ wg_listen_port }} to the container's GUA (no DNAT — IPv6 is not NATed)."
+          - "  2. Point vpn.<base-domain> AAAA at the GUA: run update_wireguard_ddns.yaml (once now; on cron only if the prefix rotates)."
+          - "  3. Enrol a device: add_wireguard_peer.yaml -e peer_name=phone -e wg_endpoint=vpn.<base-domain>"

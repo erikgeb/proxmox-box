@@ -1,0 +1,224 @@
+---
+# Point vpn.<base-domain>'s AAAA record at the WireGuard box's current global
+# IPv6 address, via the OVH DNS API — reusing the OVH credentials Caddy already
+# holds in ansible/resources/caddy.env (same provider as the DNS-01 challenge).
+#
+#   ansible-playbook ansible/update_wireguard_ddns.yaml
+#
+# The owner's IPv6 prefix is treated as STATIC for now, so this is run ONCE to set
+# the record. If a future ISP/router change makes the prefix rotate, schedule this
+# on a periodic cron (like update_proxmox_cert.yaml) to make it dynamic. Either
+# way it is idempotent: it only PUTs/POSTs when the record actually differs.
+- name: Update the WireGuard endpoint AAAA record via OVH DDNS
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    container_id: 102
+    wg_egress_if: eth0
+    # The hostname clients use as their WireGuard Endpoint = wg_subdomain.<base-domain>.
+    wg_subdomain: vpn
+    record_ttl: 60
+    resources_dir: "{{ playbook_dir }}/resources"
+    # OVH API base URL per endpoint region (mirrors the values in caddy.env.example).
+    ovh_base_urls:
+      ovh-eu: "https://eu.api.ovh.com/1.0"
+      ovh-ca: "https://ca.api.ovh.com/1.0"
+      ovh-us: "https://api.us.ovhcloud.com/1.0"
+      kimsufi-eu: "https://eu.api.kimsufi.com/1.0"
+      kimsufi-ca: "https://ca.api.kimsufi.com/1.0"
+      soyoustart-eu: "https://eu.api.soyoustart.com/1.0"
+      soyoustart-ca: "https://ca.api.soyoustart.com/1.0"
+
+  tasks:
+    # --- Read OVH credentials + BASE_DOMAIN from caddy.env (controller side) ---
+    - name: Check that caddy.env exists
+      ansible.builtin.stat:
+        path: "{{ resources_dir }}/caddy.env"
+      delegate_to: localhost
+      become: no
+      register: caddy_env_stat
+
+    - name: Fail if caddy.env is missing
+      ansible.builtin.fail:
+        msg: "{{ resources_dir }}/caddy.env not found. It supplies the OVH API credentials + BASE_DOMAIN. Copy caddy.env.example -> caddy.env and fill it in (see 05_deploy_docker_stack.yaml)."
+      when: not caddy_env_stat.stat.exists
+
+    - name: Read OVH credentials and BASE_DOMAIN from caddy.env
+      ansible.builtin.set_fact:
+        ovh_endpoint: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*OVH_ENDPOINT\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+        ovh_app_key: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*OVH_APPLICATION_KEY\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+        ovh_app_secret: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*OVH_APPLICATION_SECRET\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+        ovh_consumer_key: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*OVH_CONSUMER_KEY\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+        base_domain: "{{ lookup('ansible.builtin.file', resources_dir ~ '/caddy.env') | regex_search('(?m)^\\s*BASE_DOMAIN\\s*=\\s*(.+?)\\s*$', '\\1') | first | default('', true) }}"
+      no_log: true
+
+    - name: Validate the credentials and endpoint
+      ansible.builtin.assert:
+        that:
+          - ovh_endpoint in ovh_base_urls
+          - ovh_app_key | length > 0
+          - ovh_app_secret | length > 0
+          - ovh_consumer_key | length > 0
+          - base_domain | length > 0
+        fail_msg: "caddy.env is missing one of OVH_ENDPOINT (must be one of {{ ovh_base_urls.keys() | list }}), OVH_APPLICATION_KEY/SECRET, OVH_CONSUMER_KEY, BASE_DOMAIN."
+
+    - name: Compute derived facts
+      ansible.builtin.set_fact:
+        base_url: "{{ ovh_base_urls[ovh_endpoint] }}"
+        record_fqdn: "{{ wg_subdomain }}.{{ base_domain }}"
+
+    # --- The box's current global IPv6 address (the endpoint target) ----------
+    # Skip temporary/privacy addresses so the AAAA tracks the STABLE global address.
+    - name: Read the container's stable global IPv6 address
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c
+          "ip -6 addr show dev {{ wg_egress_if }} scope global | grep -v temporary | grep -oE '([0-9a-f]{1,4}:){2,}[0-9a-f:]+' | grep -v '^fe80' | head -n1"
+      register: gua_probe
+      changed_when: false
+
+    - name: Fail if there is no global IPv6 address
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} has no global IPv6 address on {{ wg_egress_if }}. The ISP must delegate a routable IPv6 prefix for the v6 endpoint to work (this box uses CGNAT — no public IPv4 fallback). Falling back to a relay (Tailscale / VPS) is the documented alternative."
+      when: gua_probe.stdout | trim | length == 0
+
+    - name: Set the target address
+      ansible.builtin.set_fact:
+        gua: "{{ gua_probe.stdout | trim }}"
+
+    # --- OVH server time (signatures are time-stamped to avoid clock skew) -----
+    - name: Get the OVH server time
+      ansible.builtin.uri:
+        url: "{{ base_url }}/auth/time"
+        return_content: yes
+      register: ovh_time_resp
+
+    - name: Store the timestamp
+      ansible.builtin.set_fact:
+        ovh_time: "{{ ovh_time_resp.content | trim }}"
+
+    # --- Credential-scope preflight (read-only) -------------------------------
+    # OVH consumer-key rights are bound at creation and cannot be widened later, so
+    # verify up front that this key can write zone records (POST + PUT on
+    # /domain/zone*) and fail with actionable guidance instead of a cryptic 403.
+    # NOTE: caddy.env.example already grants GET/POST/PUT/DELETE on /domain/zone/*,
+    # a superset of what DDNS needs, so the existing Caddy key should pass.
+    - name: Preflight — read this credential's granted rules
+      ansible.builtin.uri:
+        url: "{{ base_url }}/auth/currentCredential"
+        method: GET
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'GET' ~ '+' ~ base_url ~ '/auth/currentCredential' ~ '+' ~ '' ~ '+' ~ ovh_time) | hash('sha1') }}"
+        return_content: yes
+      register: ovh_cred
+      no_log: true
+
+    # A rule's path covers zone-record writes if it is a broad wildcard (/*),
+    # /domain*, or /domain/zone* — match all of these so a key granted with wider
+    # rights (e.g. unlimited /*) is not falsely rejected.
+    - name: Assert the credential can write zone records
+      vars:
+        zone_path_re: "^/([*]$|domain($|/[*]|/zone))"
+      ansible.builtin.assert:
+        that:
+          - ovh_cred.json.rules | selectattr('path', 'search', zone_path_re) | selectattr('method', 'equalto', 'POST') | list | length > 0
+          - ovh_cred.json.rules | selectattr('path', 'search', zone_path_re) | selectattr('method', 'equalto', 'PUT') | list | length > 0
+        fail_msg: >-
+          The OVH key in caddy.env lacks POST+PUT on /domain/zone* (needed to upsert the AAAA record).
+          OVH key rights cannot be widened after creation — mint a new token at the createToken URL for your
+          region with GET/POST/PUT/DELETE on /domain/zone/* (a dedicated, zone-scoped DDNS token is cleanest),
+          and update caddy.env. Current granted rules: {{ ovh_cred.json.rules }}
+
+    # --- Look up the existing AAAA record -------------------------------------
+    - name: Find an existing AAAA record for the endpoint
+      ansible.builtin.uri:
+        url: "{{ base_url }}/domain/zone/{{ base_domain }}/record?fieldType=AAAA&subDomain={{ wg_subdomain }}"
+        method: GET
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'GET' ~ '+' ~ base_url ~ '/domain/zone/' ~ base_domain ~ '/record?fieldType=AAAA&subDomain=' ~ wg_subdomain ~ '+' ~ '' ~ '+' ~ ovh_time) | hash('sha1') }}"
+        return_content: yes
+      register: ovh_records
+      no_log: true
+
+    - name: Read the current target if a record exists
+      ansible.builtin.uri:
+        url: "{{ base_url }}/domain/zone/{{ base_domain }}/record/{{ ovh_records.json[0] }}"
+        method: GET
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'GET' ~ '+' ~ base_url ~ '/domain/zone/' ~ base_domain ~ '/record/' ~ ovh_records.json[0] ~ '+' ~ '' ~ '+' ~ ovh_time) | hash('sha1') }}"
+        return_content: yes
+      register: ovh_existing
+      no_log: true
+      when: ovh_records.json | length > 0
+
+    - name: Decide what to do
+      ansible.builtin.set_fact:
+        record_exists: "{{ ovh_records.json | length > 0 }}"
+        record_id: "{{ ovh_records.json[0] | default('') }}"
+        current_target: "{{ ovh_existing.json.target | default('') if (ovh_records.json | length > 0) else '' }}"
+
+    # --- Create or update the record (only when needed) -----------------------
+    - name: Create the AAAA record (none existed)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/domain/zone/{{ base_domain }}/record"
+        method: POST
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'POST' ~ '+' ~ base_url ~ '/domain/zone/' ~ base_domain ~ '/record' ~ '+' ~ ('{\"fieldType\":\"AAAA\",\"subDomain\":\"' ~ wg_subdomain ~ '\",\"target\":\"' ~ gua ~ '\",\"ttl\":' ~ record_ttl ~ '}') ~ '+' ~ ovh_time) | hash('sha1') }}"
+          Content-Type: "application/json"
+        body: '{"fieldType":"AAAA","subDomain":"{{ wg_subdomain }}","target":"{{ gua }}","ttl":{{ record_ttl }}}'
+      register: ovh_create
+      changed_when: true
+      no_log: true
+      when: not record_exists
+
+    - name: Update the AAAA record (target changed)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/domain/zone/{{ base_domain }}/record/{{ record_id }}"
+        method: PUT
+        status_code: [200, 204]
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'PUT' ~ '+' ~ base_url ~ '/domain/zone/' ~ base_domain ~ '/record/' ~ record_id ~ '+' ~ ('{\"target\":\"' ~ gua ~ '\",\"ttl\":' ~ record_ttl ~ '}') ~ '+' ~ ovh_time) | hash('sha1') }}"
+          Content-Type: "application/json"
+        body: '{"target":"{{ gua }}","ttl":{{ record_ttl }}}'
+      register: ovh_update
+      changed_when: true
+      no_log: true
+      when: record_exists and current_target != gua
+
+    - name: Refresh the zone (apply the change)
+      ansible.builtin.uri:
+        url: "{{ base_url }}/domain/zone/{{ base_domain }}/refresh"
+        method: POST
+        status_code: [200, 204]
+        headers:
+          X-Ovh-Application: "{{ ovh_app_key }}"
+          X-Ovh-Consumer: "{{ ovh_consumer_key }}"
+          X-Ovh-Timestamp: "{{ ovh_time }}"
+          X-Ovh-Signature: "$1${{ (ovh_app_secret ~ '+' ~ ovh_consumer_key ~ '+' ~ 'POST' ~ '+' ~ base_url ~ '/domain/zone/' ~ base_domain ~ '/refresh' ~ '+' ~ '' ~ '+' ~ ovh_time) | hash('sha1') }}"
+      no_log: true
+      when: (ovh_create is changed) or (ovh_update is changed)
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "{{ record_fqdn }} AAAA -> {{ gua }}"
+          - "{{ 'Created the record.' if (ovh_create is changed) else ('Updated the record (was ' ~ current_target ~ ').' if (ovh_update is changed) else 'Already up to date — no change.') }}"
+          - "Use this as the WireGuard Endpoint: -e wg_endpoint={{ record_fqdn }}"

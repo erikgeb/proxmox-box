@@ -1,0 +1,106 @@
+---
+- name: Provision the WireGuard VPN LXC Container
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # The WireGuard subnet router lives in its own LXC (a third trust zone,
+    # separate from the Docker media stack in 100 and the vault in 101). Keep
+    # these magic values in sync with 10_deploy_wireguard.yaml,
+    # add_wireguard_peer.yaml, remove_wireguard_peer.yaml and
+    # update_wireguard_ddns.yaml.
+    container_id: 102
+    hostname: wireguard
+    ostemplate_name: "debian-13-standard_13.1-2_amd64.tar.zst"
+    ostemplate: "local:vztmpl/{{ ostemplate_name }}"
+    # rootfs (and therefore /etc/wireguard, where the keys + peer list live) is on
+    # the boot disk (local-lvm), NOT the encrypted volume. This is DELIBERATE: the
+    # VPN's job is unattended remote admin, so it must come back on its own after a
+    # reboot (e.g. a family member power-cycles the box while the owner is away) —
+    # and it is the channel through which the owner then runs unlock_storage.yaml
+    # REMOTELY to bring the encrypted services back. Trade-off: the WG server
+    # private key + peer list are unencrypted at rest, so a *stolen* box leaks them.
+    # That is scoped/low-value vs. the still-LUKS-protected photos/vault, and the
+    # keys are cheaply regenerated (re-run 10, re-enrol peers). See CLAUDE.md.
+    rootfs_storage: local-lvm
+    rootfs_size: 8
+    cores: 2
+    memory: 512
+    network_bridge: vmbr0
+    network_prefix: "192.168.0"
+    wireguard_ip_suffix: "55"
+
+  tasks:
+    # --- Host: WireGuard kernel module --------------------------------------
+    # WireGuard runs as a network-namespace-aware virtual netdev: the container
+    # creates wg0 in its own netns (it has CAP_NET_ADMIN there), but the module
+    # itself must be loaded in the HOST kernel — a container cannot load it. No
+    # /dev/net/tun and no nesting are needed for the kernel path.
+    - name: Ensure the wireguard kernel module is loaded and persisted on the host
+      community.general.modprobe:
+        name: wireguard
+        state: present
+        persistent: present
+
+    - name: Verify the wireguard module is available in this kernel build
+      ansible.builtin.command: modinfo wireguard
+      register: wg_modinfo
+      changed_when: false
+      failed_when: wg_modinfo.rc != 0
+
+    # --- pct: OS template ----------------------------------------------------
+    - name: Refresh the appliance template catalog
+      ansible.builtin.command: pveam update
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the OS template is already downloaded
+      ansible.builtin.command: "pveam list local"
+      register: pveam_list
+      changed_when: false
+
+    - name: Download the Debian OS template
+      ansible.builtin.command: "pveam download local {{ ostemplate_name }}"
+      when: ostemplate_name not in pveam_list.stdout
+      register: tmpl_download
+      changed_when: tmpl_download.rc == 0
+
+    # --- pct: create the container ------------------------------------------
+    - name: Check whether the container already exists
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    # --onboot 1: autostart on boot, unattended — the whole point of this VPN.
+    # ip6=auto: SLAAC a global IPv6 address (GUA) from the ISP-delegated prefix.
+    # Because the ISP uses CGNAT there is no public IPv4, so the tunnel is reached
+    # over IPv6 (wg-quick binds the ListenPort dual-stack automatically). No bind
+    # mount and no secure-storage dependency: /etc/wireguard is on the rootfs.
+    - name: Create the WireGuard LXC container
+      ansible.builtin.command:
+        cmd: >-
+          pct create {{ container_id }} {{ ostemplate }}
+          --hostname {{ hostname }}
+          --cores {{ cores }}
+          --memory {{ memory }}
+          --unprivileged 1
+          --onboot 1
+          --rootfs {{ rootfs_storage }}:{{ rootfs_size }}
+          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ wireguard_ip_suffix }}/24,gw={{ network_prefix }}.1,ip6=auto
+      when: ct_status.rc != 0
+      register: ct_create
+      changed_when: ct_create.rc == 0
+
+    # onboot is reconciled every run in case the container predates this setting
+    # or was changed by hand — autostart is a hard requirement here.
+    - name: Ensure the container is set to start on boot
+      ansible.builtin.command: "pct set {{ container_id }} --onboot 1"
+      register: ct_onboot
+      changed_when: ct_onboot.rc == 0
+
+    - name: Display provisioning result
+      ansible.builtin.debug:
+        msg: "Container {{ container_id }} ({{ hostname }}) provisioned (unprivileged, no nesting, onboot=1). It autostarts on every boot independent of the LUKS unlock — unlock_storage.yaml is intentionally NOT modified. Deploy WireGuard with 10_deploy_wireguard.yaml."

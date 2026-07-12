@@ -1,0 +1,76 @@
+---
+# Revoke a WireGuard client (recurrent operational tool — e.g. a lost device).
+#
+#   ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
+#
+# Strips the peer's block from wg0.conf, deletes its stored client config, and
+# hot-reloads the interface with `wg syncconf` so the peer is dropped live
+# without disturbing the others. No-op if the peer is absent.
+- name: Remove a WireGuard peer
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep in sync with 09/10_*wireguard*.yaml.
+    container_id: 102
+    wg_interface: wg0
+    wg_conf: /etc/wireguard/wg0.conf
+    clients_dir: /etc/wireguard/clients
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - peer_name is defined and peer_name | length > 0
+          - peer_name is match('^[A-Za-z0-9_-]+$')
+        fail_msg: "Required: -e peer_name=<name> (the name used with add_wireguard_peer.yaml)."
+
+    - name: Check the WireGuard LXC is running
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the WireGuard LXC is not running
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} is not running."
+      when: "'status: running' not in ct_status.stdout"
+
+    - name: Check whether this peer exists
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- grep -qxF '# {{ peer_name }}' {{ wg_conf }}"
+      register: peer_check
+      changed_when: false
+      failed_when: false
+
+    - name: Report that the peer does not exist
+      ansible.builtin.debug:
+        msg: "No peer named '{{ peer_name }}' in {{ wg_conf }} — nothing to do."
+      when: peer_check.rc != 0
+
+    # Delete the block from the '# <name>' marker through its AllowedIPs line
+    # (the 4-line [Peer] block this repo writes), squeeze any doubled blank lines,
+    # remove the stored client config, then reload the live interface.
+    - name: Remove the peer block, delete its client config, and reload
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          sed -i "/^# {{ peer_name }}$/,/^AllowedIPs/d" {{ wg_conf }};
+          tmp=$(mktemp);
+          cat -s {{ wg_conf }} > "$tmp";
+          cat "$tmp" > {{ wg_conf }};
+          rm -f "$tmp";
+          rm -f {{ clients_dir }}/{{ peer_name }}.conf;
+          wg syncconf {{ wg_interface }} <(wg-quick strip {{ wg_interface }})
+          '
+      when: peer_check.rc == 0
+      register: peer_remove
+      changed_when: peer_remove.rc == 0
+
+    - name: Report removal
+      ansible.builtin.debug:
+        msg: "Peer '{{ peer_name }}' removed and dropped from the live interface (other peers unaffected)."
+      when: peer_check.rc == 0

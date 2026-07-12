@@ -65,7 +65,42 @@ phone, IoT device, or guest on the same network is in scope.
   Optional add-ons: `MaxAuthTries`, idle `ClientAliveInterval`.
 - **Files:** `ansible/bootstrap/01_bootstrap_and_harden.yaml`.
 
-## P4 — Post-deploy / post-upgrade health verification
+## P4 — Enforce trust-zone isolation with the Proxmox firewall
+
+The threat model treats LXC 100 (media/Docker, `nesting` on) and LXC 101 (the vault) as
+**different trust zones** with blast-radius isolation as the explicit goal — but nothing
+currently *enforces* that at the network layer. A compromised Immich/Caddy/Syncthing
+container can today reach anything on the LAN, including the vault's `:8000` and the Proxmox
+management plane on `:8006`. The Proxmox built-in firewall (nftables) is the natural
+enforcement; use it for two **narrow** rules, not a blanket lockdown:
+
+- Restrict **101 inbound** to accept `:8000` only from LXC 100's IP — the Caddy
+  reverse-proxy path documented as the *one* sanctioned cross-zone flow — and drop the rest.
+- Restrict the **management plane** (host SSH `22` + Proxmox UI `8006`) to the admin
+  workstation IP(s) only. "LAN-only" still includes a compromised phone/IoT/guest device.
+
+- **Why:** highest-value *new* live-attack control — it enforces a separation already
+  designed but currently unenforced. Sits alongside P3 (the other access-boundary item),
+  above the robustness/maintainability items, but still below the P1 data-loss work.
+- **Trade-off / footgun:** the Proxmox firewall defaults to drop once enabled and is the
+  easiest way to lock yourself out of a headless box. **Mitigate before enabling:** pin the
+  admin + guest IPs to DHCP reservations, keep a host-node `management` allow rule for the
+  admin IP in place *before* turning it on, and rely on physical-console recovery (acceptable
+  here only because the box is owner-present and availability isn't critical).
+- **VPN interplay (new):** the WireGuard VPN now adds a third zone (LXC 102) and the box's
+  one sanctioned inbound flow. The firewall must (a) allow inbound `udp/51820` to 102's IPv6
+  GUA and the tunnel↔LAN forward path, and **not** fight 102's own in-container `iptables`
+  (pick one enforcement layer per container — simplest is to leave the PVE firewall off for
+  102); (b) remember that VPN clients are **MASQUERADE'd to 102's IP (`192.168.0.55`)**, so
+  the management-plane restriction below must allow `.55` if admin-over-VPN is to keep working
+  (you cannot distinguish individual VPN clients at the firewall once they're NAT'd).
+- **Fix:** a new `ansible/bootstrap/11_configure_firewall.yaml` (09/10 are now the WireGuard
+  VPN) writing `/etc/pve/firewall/cluster.fw` + a per-guest `101.fw` (idempotent), parameterized
+  by the admin IP and the 100/101/102 IPs; enable the firewall last.
+- **Files:** new `ansible/bootstrap/11_configure_firewall.yaml`; README runbook +
+  CLAUDE.md sequencing/topology notes.
+
+## P5 — Post-deploy / post-upgrade health verification
 
 Several playbooks report success when services are actually dead. `05_deploy_docker_stack.yaml`
 and `update_docker_stack.yaml` run `docker compose up -d` and finish without checking that
@@ -82,7 +117,7 @@ copy — it already does an `/alive` health check with retries and auto-rollback
 - **Files:** `ansible/bootstrap/05_deploy_docker_stack.yaml`, `ansible/update_docker_stack.yaml`,
   `ansible/update_proxmox.yaml`.
 
-## P5 — Tighten version pinning & remove brittle hardcoded values
+## P6 — Tighten version pinning & remove brittle hardcoded values
 
 Reproducibility/maintainability drift, plus one brittle constant:
 
@@ -102,8 +137,15 @@ Reproducibility/maintainability drift, plus one brittle constant:
 
 ## Nice to have
 
-Lower-priority polish; didn't make the top 5.
+Lower-priority polish; didn't make the prioritized list.
 
+- **Docker stack capability hardening.** LXC 100 runs with `nesting` on (the looser
+  container), so cheap defense-in-depth on the compose services is worthwhile: add
+  `security_opt: [no-new-privileges:true]` and `cap_drop: [ALL]` to each service, re-adding
+  only what each image needs (e.g. Caddy needs `NET_BIND_SERVICE` if it binds low ports;
+  most others need nothing). Limits what a container break-in can escalate to. Pairs with
+  the systemd-sandboxing item below (same defense-in-depth spirit, on the vault side).
+  *Files:* `ansible/resources/docker-compose.yml`.
 - **VaultWarden admin token resilience.** `07_deploy_vaultwarden.yaml` prints the `/admin`
   token once to stdout — a lost terminal scrollback is fatal. Also write it to
   `/etc/vaultwarden/ADMIN_TOKEN` mode 0600. *Files:* `ansible/bootstrap/07_deploy_vaultwarden.yaml`.
