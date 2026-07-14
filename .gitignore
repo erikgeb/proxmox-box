@@ -6,3 +6,6 @@ ansible/resources/.env
 
 # Caddy / OVH DNS-01 API credentials. Commit only caddy.env.example.
 ansible/resources/caddy.env
+
+# Local ansible settings to avoid needing to pass them on CLI
+group_vars/all.yaml

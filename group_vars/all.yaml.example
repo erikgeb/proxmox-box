@@ -1,0 +1,7 @@
+---
+# Copy this file without .example to set default values for your deployment
+# Default values for all playbooks in this folder
+backups_root: "/mnt/pve/secure-storage/syncthing_share/my-personal-sync/tech/pve-vaultwarden"
+syncthing_drop_dir: "/mnt/pve/secure-storage/syncthing_share/my-personal-sync/tech/pve-vaultwarden"
+target_disk: "/dev/sda"
+vaultwarden_ip: "192.168.0.77"
