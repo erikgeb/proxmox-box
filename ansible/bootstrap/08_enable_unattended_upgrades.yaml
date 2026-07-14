@@ -60,5 +60,5 @@
       ansible.builtin.debug:
         msg:
           - "Unattended SECURITY upgrades enabled (Debian-Security origin only, no auto-reboot)."
-          - "Verify: sudo unattended-upgrade --dry-run --debug  and  systemctl status apt-daily-upgrade.timer"
+          - "Verify: `sudo unattended-upgrade --dry-run --debug`  and  `systemctl status apt-daily-upgrade.timer`"
           - "Run ansible/update_proxmox.yaml for full host + guest dist-upgrades (incl. PVE)."
