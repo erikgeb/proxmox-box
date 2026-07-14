@@ -7,11 +7,12 @@ name: immich
 # Secrets (the DB password) live in a sibling `.env` file — copy `.env.example`
 # to `.env` and fill it in. `.env` is gitignored; never commit it.
 #
-# Image tags below were verified against the upstream Immich compose
-# (github.com/immich-app/immich/blob/main/docker/docker-compose.yml) on
-# 2026-06-21. Immich is on major v2 (latest stable v2.7.5); IMMICH_VERSION is
-# pinned in .env. The postgres/valkey tags track upstream — re-check them when
-# bumping Immich. linuxserver/syncthing is pinned to a stable ls tag.
+# Image tags below were verified against the upstream Immich compose at its
+# v3.0.2 release tag (github.com/immich-app/immich/blob/v3.0.2/docker/
+# docker-compose.yml) on 2026-07-14. IMMICH_VERSION is pinned in .env. The
+# postgres/valkey tags track upstream — re-check them when bumping Immich
+# (at a MAJOR bump, diff this file against upstream's release compose).
+# linuxserver/syncthing is pinned to a stable ls tag.
 
 # Cap container JSON logs so they can't grow unbounded on the LXC boot disk
 # (rootfs is on local-lvm, NOT the encrypted volume). Without this, Docker's
@@ -31,7 +32,9 @@ services:
     container_name: immich_server
     image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
     volumes:
-      - /mnt/storage/immich_data:/usr/src/app/upload
+      # /data is the media location since Immich v3 (the legacy
+      # /usr/src/app/upload fallback was removed with the v2 deprecations).
+      - /mnt/storage/immich_data:/data
       - /etc/localtime:/etc/localtime:ro
     env_file:
       - .env
@@ -77,6 +80,9 @@ services:
       POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       - /mnt/storage/immich_db:/var/lib/postgresql/data
+    # Docker's default 64 MB /dev/shm can starve Postgres during vacuum/index
+    # work; matches the upstream Immich compose.
+    shm_size: 128mb
     healthcheck:
       test: >-
         pg_isready --dbname="$${POSTGRES_DB}" --username="$${POSTGRES_USER}" || exit 1
