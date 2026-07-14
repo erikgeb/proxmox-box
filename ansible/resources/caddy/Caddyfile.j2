@@ -4,7 +4,12 @@
 # the ACME DNS-01 challenge (the box has no inbound HTTP, so HTTP-01/TLS-ALPN
 # are impossible) using the OVH DNS provider, and auto-renewed by Caddy.
 #
-# All `{$VAR}` values are read from caddy.env (sibling file, gitignored). The
+# All `{$VAR}` values are read from caddy.env (sibling file, gitignored) at
+# Caddy RUNTIME. Double-braced values are Jinja2, rendered at DEPLOY time by
+# 05_deploy_docker_stack.yaml (ansible.builtin.template) — which is why this
+# file is named .j2; it lands in the container as plain `Caddyfile`. Caddy's
+# single-brace placeholders pass through Jinja untouched — but a literal
+# double brace anywhere (even in a comment) would be parsed as Jinja. The
 # upstream names below are docker-compose *service names*, resolved on the
 # shared compose project network.
 #
@@ -38,11 +43,13 @@
 	}
 
 	# VaultWarden runs in LXC 101 (a separate trust zone), NOT on this compose
-	# network — so it is reached by IP, not service name. WebSocket notifications
-	# are proxied transparently by reverse_proxy.
+	# network — so it is reached by IP, not service name. The IP is rendered at
+	# deploy time from vaultwarden_ip (override in group_vars/all.yaml; keep in
+	# step with 06's vaultwarden_ip_suffix). WebSocket notifications are proxied
+	# transparently by reverse_proxy.
 	@vault host vault.{$BASE_DOMAIN}
 	handle @vault {
-		reverse_proxy 192.168.0.54:8000
+		reverse_proxy {{ vaultwarden_ip | default('192.168.0.54') }}:8000
 	}
 
 	handle {

@@ -174,9 +174,12 @@
       register: push_caddy_dockerfile
       changed_when: push_caddy_dockerfile.rc == 0
 
-    - name: Stage the Caddyfile on the Proxmox host
-      ansible.builtin.copy:
-        src: "{{ resources_dir }}/caddy/Caddyfile"
+    # The Caddyfile is a Jinja2 template (.j2): the @vault route's cross-zone IP
+    # renders from vaultwarden_ip (group_vars override, default .54) at deploy
+    # time. Caddy's own {$VAR} placeholders pass through untouched.
+    - name: Render and stage the Caddyfile on the Proxmox host
+      ansible.builtin.template:
+        src: "{{ resources_dir }}/caddy/Caddyfile.j2"
         dest: /tmp/docker-stack-Caddyfile
         mode: "0644"
 

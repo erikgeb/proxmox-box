@@ -93,9 +93,11 @@ ansible-playbook ansible/bootstrap/06_provision_vaultwarden_lxc.yaml
 # (prints it ONCE — save it), and starts the hardened systemd service.
 ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml
 
-# The @vault block in caddy/Caddyfile (vault.<base-domain> -> 192.168.0.54:8000)
-# is already enabled, so a fresh `05` run serves it. If you deployed Caddy before
-# enabling it, re-run 05 to push the updated Caddyfile, then reload Caddy:
+# The @vault block in caddy/Caddyfile.j2 (vault.<base-domain> -> the VaultWarden
+# LXC, vaultwarden_ip — override in group_vars/all.yaml, default 192.168.0.54:8000;
+# rendered at deploy time) is already enabled, so a fresh `05` run serves it. If
+# you deployed Caddy before enabling it (or changed vaultwarden_ip), re-run 05 to
+# push the re-rendered Caddyfile, then reload Caddy:
 #   ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
 #   pct exec 100 -- docker compose -f /opt/docker-stack/docker-compose.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
 #
