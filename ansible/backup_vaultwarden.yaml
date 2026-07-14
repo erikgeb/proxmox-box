@@ -25,8 +25,13 @@
 #   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder>
 #   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_backups=14
 #
-# Restore (needs the OFFLINE private key — see README):
-#   age -d -i <private-key-file> vault-<ts>.age | tar xz -C <restore-dir>
+# Restore is automated by ansible/recovery/recover_vaultwarden.yaml (DESTRUCTIVE —
+# overwrites the live vault; snapshots first + auto-rolls back on failure):
+#   ansible-playbook ansible/recovery/recover_vaultwarden.yaml \
+#     -e backup_path=<host path to a vault-<ts>.age> \
+#     -e age_identity_file=<controller path to the OFFLINE private key>
+# (Manual decrypt, e.g. to inspect a backup off-box:
+#   age -d -i <private-key-file> vault-<ts>.age | tar xz -C <restore-dir>)
 - name: Back up the VaultWarden vault (encrypted) to the Syncthing pipeline
   hosts: proxmox
   gather_facts: no
@@ -240,4 +245,5 @@
         msg:
           - "Encrypted vault backup written to {{ archive_path }} (keeping the {{ keep_backups }} most recent vault-*.age)."
           - "It will sync to the personal machine via Syncthing, then ride the USB backup."
-          - "Restore with the OFFLINE private key: age -d -i <key-file> {{ archive_path }} | tar xz -C <restore-dir>"
+          - "Restore (DESTRUCTIVE — overwrites the live vault; snapshots first + auto-rolls back on failure; needs the OFFLINE private key):"
+          - "  ansible-playbook ansible/recovery/recover_vaultwarden.yaml -e backup_path={{ archive_path }} -e age_identity_file=<controller path to the offline key>"

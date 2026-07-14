@@ -38,8 +38,13 @@
 #     -e immich_version=v2.8.0 \
 #     -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/immich_db_backups   # snapshot+encrypt DB, then bump
 #
-# Restore (needs the OFFLINE private key — see README):
-#   age -d -i <key-file> immich-db-<ts>.sql.gz.age | gunzip | docker exec -i immich_postgres psql -U postgres -d postgres
+# Restore is automated by ansible/recovery/recover_immich.yaml (DESTRUCTIVE —
+# overwrites the live Immich DB; snapshots first + auto-rolls back on failure;
+# needs the OFFLINE private key). To roll back a version bump, first re-pin the
+# old Immich (and postgres tag, if it changed), then restore the pre-bump dump:
+#   ansible-playbook ansible/recovery/recover_immich.yaml \
+#     -e backup_path=<host path to the immich-db-*.sql.gz.age> \
+#     -e age_identity_file=<controller path to the OFFLINE private key>
 #
 # Requires the encrypted storage mounted (run unlock_storage.yaml first).
 - name: Update the Docker application stack in LXC 100
@@ -348,5 +353,6 @@
         msg:
           - "Pre-bump Immich DB dump (encrypted) at {{ db_archive_path }} (keeping the {{ keep_db_backups }} most recent; syncs off-box via Syncthing)."
           - "Verify the new Immich came up cleanly (watch for the first-start migration to finish): pct exec {{ container_id }} -- docker logs -f immich_server"
-          - "If the migration failed and you must restore (needs the OFFLINE age private key): stop the stack, RESET the immich_db data dir (a partially-migrated DB cannot be loaded into), bring up an empty Postgres, then: age -d -i <key-file> {{ db_archive_path }} | gunzip | docker exec -i {{ immich_postgres_container }} psql -U {{ db_username }} -d postgres   — and pin Immich back with -e immich_version=<old>. Match the Postgres image to that Immich version."
+          - "If the migration failed: pin Immich back first (re-set the postgres tag in docker-compose.yml if you changed it, then re-run this playbook with -e immich_version={{ immich_installed.stdout | trim | default('<old>', true) }}), then restore the dump (needs the OFFLINE age private key):"
+          - "  ansible-playbook ansible/recovery/recover_immich.yaml -e backup_path={{ db_archive_path }} -e age_identity_file=<controller path to the offline key>"
       when: immich_version is defined
