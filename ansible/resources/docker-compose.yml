@@ -94,7 +94,7 @@ services:
 
   syncthing:
     <<: *default-logging
-    image: lscr.io/linuxserver/syncthing:v2.1.1-ls220
+    image: lscr.io/linuxserver/syncthing:v2.1.2-ls224
     container_name: syncthing
     # Pin the service uid/gid so it maps to host 100911 under the unprivileged
     # LXC id-shift (matches the syncthing_share chown in 04_provision_docker_lxc.yaml).
