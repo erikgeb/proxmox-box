@@ -310,13 +310,18 @@
               '
           changed_when: true
 
+        # Replace the CONTENTS in place — never `rm -rf` the directory itself:
+        # it is the source of the running container's mp0 bind mount, which is
+        # pinned to the directory INODE. Deleting/recreating it leaves the
+        # container attached to the unlinked inode (reads empty, writes ENOENT)
+        # until the container restarts.
         - name: Restore the vault data directory
           ansible.builtin.command:
             cmd: >-
               bash -c '
               set -euo pipefail;
-              rm -rf {{ secure_storage_path }}/{{ data_subdir }};
-              cp -a {{ backup_dir }}/data {{ secure_storage_path }}/{{ data_subdir }}
+              find {{ secure_storage_path }}/{{ data_subdir }} -mindepth 1 -delete;
+              cp -a {{ backup_dir }}/data/. {{ secure_storage_path }}/{{ data_subdir }}/
               '
           changed_when: true
 
