@@ -23,7 +23,7 @@
 #
 # Usage:
 #   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/<shared-folder>
-#   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_backups=14
+#   ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_daily=14 -e keep_monthly=24
 #
 # Restore is automated by ansible/recovery/recover_vaultwarden.yaml (DESTRUCTIVE —
 # overwrites the live vault; snapshots first + auto-rolls back on failure):
@@ -50,7 +50,16 @@
     vault_backups_root: "{{ secure_storage_path }}/vaultwarden_backups"
     age_recipient_file: "{{ vault_backups_root }}/age-recipient.pub"
     staging_dir: "{{ vault_backups_root }}/.staging"
-    keep_backups: 7
+    # Tiered (grandfather-father-son) retention for the drop folder, meant for a
+    # DAILY cron. Computed from the DATE embedded in each filename, so it is
+    # stateless and robust to gaps (a missed cron day never empties a tier):
+    #   keep_daily   — keep ALL backups from the N most recent days that have one
+    #   keep_weekly  — plus the newest backup of each of the N most recent ISO weeks
+    #   keep_monthly — plus the newest backup of each of the N most recent months
+    # One archive may satisfy several tiers at once (restic-style semantics).
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 12
     # syncthing_drop_dir is REQUIRED via -e: the host path of a folder Syncthing
     # already shares with the personal machine (so the .age archive auto-syncs and
     # then rides the existing USB backup). No default — fail fast if absent.
@@ -227,13 +236,45 @@
         mode: "0644"
 
     # --- Phase 5: housekeeping ----------------------------------------------
-    # Pruned archives also disappear from the personal machine on the next sync —
-    # long-term history is kept on the USB drives by design, not in the live folder.
-    - name: Prune old encrypted archives (keep the most recent N)
+    # Tiered prune (see the keep_* vars above). Walks the archives newest-first
+    # by the date in the filename and keeps the union of the three tiers;
+    # everything else is deleted. A file whose name does not parse is always
+    # kept (never delete what we cannot reason about). Pruned archives also
+    # disappear from the personal machine on the next sync — long-term history
+    # is kept on the USB drives by design, not in the live folder.
+    - name: Prune old encrypted archives (tiered daily/weekly/monthly retention)
       ansible.builtin.shell:
-        cmd: "cd {{ syncthing_drop_dir }} && ls -1t vault-*.age 2>/dev/null | tail -n +{{ keep_backups + 1 }} | xargs -r rm -f"
+        cmd: |
+          set -euo pipefail
+          cd {{ syncthing_drop_dir }}
+          mapfile -t files < <(ls -1 vault-*.age 2>/dev/null | sort -r)
+          declare -A keep day_seen week_seen month_seen
+          days=0; weeks=0; months=0
+          for f in "${files[@]}"; do
+            d="${f#vault-}"; d="${d%%-*}"                       # YYYYMMDD from vault-<ts>.age
+            if ! [[ "$d" =~ ^[0-9]{8}$ ]] || ! w=$(date -d "$d" +%G-%V 2>/dev/null); then
+              keep[$f]=1; continue                              # unparsable name: keep
+            fi
+            m="${d:0:6}"
+            if [[ -z "${day_seen[$d]:-}" ]] && [[ "$days" -lt {{ keep_daily }} ]]; then
+              day_seen[$d]=1; days=$((days + 1))
+            fi
+            [[ -n "${day_seen[$d]:-}" ]] && keep[$f]=1          # ALL backups of a kept day
+            if [[ -z "${week_seen[$w]:-}" ]] && [[ "$weeks" -lt {{ keep_weekly }} ]]; then
+              week_seen[$w]=1; weeks=$((weeks + 1)); keep[$f]=1 # newest of that ISO week
+            fi
+            if [[ -z "${month_seen[$m]:-}" ]] && [[ "$months" -lt {{ keep_monthly }} ]]; then
+              month_seen[$m]=1; months=$((months + 1)); keep[$f]=1  # newest of that month
+            fi
+          done
+          for f in "${files[@]}"; do
+            if [[ -z "${keep[$f]:-}" ]]; then
+              rm -f -- "$f" && echo "pruned $f"
+            fi
+          done
         executable: /bin/bash
-      changed_when: false
+      register: prune
+      changed_when: prune.stdout | length > 0
 
     - name: Remove the staging directory
       ansible.builtin.file:
@@ -243,7 +284,7 @@
     - name: Report success
       ansible.builtin.debug:
         msg:
-          - "Encrypted vault backup written to {{ archive_path }} (keeping the {{ keep_backups }} most recent vault-*.age)."
+          - "Encrypted vault backup written to {{ archive_path }}. Retention: all backups of the last {{ keep_daily }} backup days + newest per week for {{ keep_weekly }} weeks + newest per month for {{ keep_monthly }} months."
           - "It will sync to the personal machine via Syncthing, then ride the USB backup."
           - "Restore (DESTRUCTIVE — overwrites the live vault; snapshots first + auto-rolls back on failure; needs the OFFLINE private key):"
           - "  ansible-playbook ansible/recovery/recover_vaultwarden.yaml -e backup_path={{ archive_path }} -e age_identity_file=<controller path to the offline key>"

@@ -208,8 +208,15 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     pipeline. Pass the host path of that shared folder via -e (the canonical one
 #     set up during deploy is syncthing_share/vault_backups):
 #       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups
-#       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_backups=14
+#       ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=... -e keep_daily=14 -e keep_monthly=24
 #     Requires the encrypted storage mounted (run unlock_storage.yaml first).
+#     Retention is TIERED (grandfather-father-son), designed for a DAILY schedule:
+#     ALL backups of the last 7 backup days + the newest backup of each of the
+#     last 4 ISO weeks + the newest of each of the last 12 months (~21 small
+#     files at steady state; override with -e keep_daily/keep_weekly/keep_monthly).
+#     Tiers are computed from the DATE in each filename, not from the calendar
+#     day the prune runs — a missed cron day shifts the window, it never empties
+#     a tier.
 #
 #     ENCRYPTION KEY (read once): on its FIRST run the playbook generates an age
 #     keypair, keeps only the PUBLIC key on the box (so future runs encrypt with no
@@ -220,22 +227,25 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     that would defeat the off-box protection.) An attacker who steals the box AND
 #     a USB drive still cannot read the vault.
 #
-#     Schedule it for regular runs on the controller (run it MANUALLY once first,
+#     Schedule it for DAILY runs on the controller (run it MANUALLY once first,
 #     so you can capture and store the age private key it prints — scheduled runs
-#     are then fully non-interactive). Example: every Monday at 12:00 (noon), i.e.
-#     cron's `0 12 * * 1` (day-of-week 1 = Monday). cron runs with a minimal PATH,
-#     so use the ABSOLUTE ansible-playbook path — find it with `which ansible-playbook`.
+#     are then fully non-interactive). The tiered retention above assumes a daily
+#     cadence: it shrinks the window of un-backed-up vault changes to <24h at the
+#     cost of seconds of downtime per day. Example: every day at 12:00 (noon),
+#     i.e. cron's `0 12 * * *`. cron runs with a minimal PATH, so use the
+#     ABSOLUTE ansible-playbook path — find it with `which ansible-playbook`.
 #
 #       LINUX — add with `crontab -e`:
-#         0 12 * * 1 cd /path/to/proxmox-box && /usr/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
+#         0 12 * * * cd /path/to/proxmox-box && /usr/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
 #
 #       macOS — add with `crontab -e` (cron still works; homebrew installs
 #       ansible-playbook under /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel):
-#         0 12 * * 1 cd /path/to/proxmox-box && /opt/homebrew/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
-#       macOS caveats: the Mac must be AWAKE at 12:00 Monday (cron does not wake it);
+#         0 12 * * * cd /path/to/proxmox-box && /opt/homebrew/bin/ansible-playbook ansible/backup_vaultwarden.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/vault_backups >> "$HOME/proxmox-backup.log" 2>&1
+#       macOS caveats: the Mac must be AWAKE at 12:00 (cron does not wake it; a
+#       missed day is caught up by the next run's retention window, not lost);
 #       if runs fail silently, grant `cron` Full Disk Access in System Settings >
 #       Privacy & Security. To survive sleep, prefer a launchd LaunchAgent with a
-#       StartCalendarInterval of { Weekday = 1; Hour = 12; Minute = 0; } instead of cron.
+#       StartCalendarInterval of { Hour = 12; Minute = 0; } instead of cron.
 #
 #     RESTORE (automated — ansible/recovery/recover_vaultwarden.yaml): this is
 #     DESTRUCTIVE (the live vault is overwritten and every change since the backup
@@ -253,6 +263,40 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     (no key needed): -e backup_path=/mnt/pve/secure-storage/vaultwarden_backups/<ts>_<ver>/data
 #     If the .age archive is only on a USB drive / your laptop, copy it onto the box
 #     first (e.g. into the Syncthing folder) and point backup_path at that host path.
+#
+#     AFTER A RESTORE — changes made since the backup (there is NO automatic
+#     reconciliation): Bitwarden's sync is server-authoritative. Client apps keep
+#     a local encrypted cache that is a read replica of the last sync, and every
+#     edit is a per-entry API call against the server's copy. So a client that
+#     synced BEFORE the restore still shows entries the restored server no longer
+#     has ("ghosts"): editing one fails with "cipher does not exist". The ghosts
+#     are NOT cleared immediately: clients only re-download the vault when the
+#     server's account REVISION DATE is newer than their last-sync timestamp, and
+#     a freshly restored (older) vault's usually is not — so pull-to-refresh
+#     appears to do nothing and the ghosts linger (observed with the mobile app).
+#     The FIRST write on the server side (any edit, from any client or the web
+#     UI) bumps the revision date, and the next sync then replaces the local
+#     cache WHOLESALE, silently erasing the ghosts — clients never push their
+#     cache back. The window is therefore unpredictable: one edit from anywhere
+#     closes it. If lost entries matter, extract them NOW via airplane mode
+#     (below) instead of relying on the lingering. Two places those entries
+#     still exist, in order of preference:
+#       1. The pre-restore snapshot the restore playbook always takes. To undo the
+#          whole restore:
+#            -e backup_path=/mnt/pve/secure-storage/vaultwarden_backups/pre-restore-<ts>/data
+#          Or to cherry-pick: restore that snapshot, export / copy out the items
+#          added since the backup, restore the intended backup again, re-add them.
+#       2. A client's local cache (e.g. the phone) — the only copy left when the
+#          box's disk is truly gone. Put the device in AIRPLANE MODE first: the
+#          app auto-syncs when foregrounded with network, and while a sync only
+#          erases the ghosts once the server's revision date has moved (see
+#          above), airplane mode makes the export independent of that race. Open
+#          the app (it unlocks offline), export the LOCAL vault via Settings ->
+#          Vault -> Export vault, and move the file off the device. Then re-add the missing
+#          items by hand, or import a PRUNED file (Web vault -> Tools -> Import;
+#          import does NOT dedupe — importing the full export duplicates every
+#          entry that survived). Finally let the device sync normally and securely
+#          delete the plaintext export.
 #
 #   * Immich database: the DB holds the CURATED metadata — albums, manual tags,
 #     named people (faces are re-detected on restore, but the names you assigned
