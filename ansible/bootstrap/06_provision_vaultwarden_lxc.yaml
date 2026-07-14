@@ -24,7 +24,10 @@
     memory: 1024
     network_bridge: vmbr0
     network_prefix: "192.168.0"
-    vaultwarden_ip_suffix: "54"
+    # vaultwarden_ip_suffix is deliberately NOT set here: play vars silently
+    # SHADOW inventory group_vars (../../group_vars/all.yaml), which is where a
+    # deployment overrides it (keep vaultwarden_ip there in step with it). The
+    # repo default (54) is applied at the use site instead.
     secure_storage_path: /mnt/pve/secure-storage
     # Only the vaultwarden_data subdir is bind-mounted in — NOT the whole secure
     # volume — so this container cannot see the immich/syncthing data (trust-zone
@@ -89,7 +92,7 @@
           --unprivileged 1
           --onboot 0
           --rootfs {{ rootfs_storage }}:{{ rootfs_size }}
-          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ vaultwarden_ip_suffix }}/24,gw={{ network_prefix }}.1
+          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ vaultwarden_ip_suffix | default('54') }}/24,gw={{ network_prefix }}.1
       when: ct_status.rc != 0
       register: ct_create
       changed_when: ct_create.rc == 0

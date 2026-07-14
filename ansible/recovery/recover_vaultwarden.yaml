@@ -55,7 +55,10 @@
     secure_storage_path: /mnt/pve/secure-storage
     data_subdir: vaultwarden_data
     data_owner: "101000:101000"   # unprivileged-LXC id-shift of the service uid 1000
-    vaultwarden_ip: "192.168.0.54"
+    # vaultwarden_ip is deliberately NOT set here: play vars silently SHADOW
+    # inventory group_vars (../../group_vars/all.yaml), which is where a
+    # deployment overrides it. The repo default (.54) is applied at the use
+    # site with | default(...) instead.
     rocket_port: 8000
     backups_root: "{{ secure_storage_path }}/vaultwarden_backups"
     staging_dir: "{{ backups_root }}/.restore-staging"
@@ -259,7 +262,7 @@
         # that the binary cannot open / migrate.
         - name: Wait for VaultWarden to answer /alive on the restored vault
           ansible.builtin.uri:
-            url: "http://{{ vaultwarden_ip }}:{{ rocket_port }}/alive"
+            url: "http://{{ vaultwarden_ip | default('192.168.0.54') }}:{{ rocket_port }}/alive"
             status_code: 200
           delegate_to: localhost
           become: no
