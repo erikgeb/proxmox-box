@@ -25,13 +25,18 @@ disk failure (not even theft) loses whatever that manual routine didn't happen t
 - **Why #1:** matches the threat model — at-rest theft is the *accepted* risk, but
   hardware failure / operator error is unaddressed and the blast radius is total and
   irreversible. This outranks the security items precisely because the box is LAN-only.
-- **Fix:** add an `ansible/immich_backup.yaml` that codifies the one-way, read-only
-  `rsync` pull the README currently only describes in prose, plus the Immich DB dump;
-  document and periodically run a **restore drill** (decrypt a vault `.age`, restore an
-  Immich DB dump into a scratch container) and record when it was last tested.
-- **Files:** new `ansible/immich_backup.yaml`; README backup section. Reuse the snapshot
-  pattern from `ansible/backup_vaultwarden.yaml` and the existing
-  `ansible/bootstrap/99_optional_immich_db_backup.yaml`.
+- **DONE (2026-07-14):** the Immich DB half — `ansible/backup_immich.yaml` (encrypted
+  `pg_dumpall` into the Syncthing pipeline, same age recipient as the pre-bump dump)
+  and `ansible/recovery/recover_immich.yaml` (staged/validated destructive restore
+  with pre-restore snapshot + auto-rollback, also accepts the built-in `*.sql.gz`
+  dumps and raw data-dir snapshots).
+- **Remaining fix:** codify the one-way, read-only `rsync` pull of the photo
+  originals that the README currently only describes in prose (it runs from the
+  personal machine, so likely a documented script/cron rather than an Ansible play
+  against the box); document and periodically run a **restore drill** (vault restore
+  via `recover_vaultwarden.yaml`, Immich DB restore via `recover_immich.yaml`) and
+  record when it was last tested.
+- **Files:** README backup section (rsync codification); drill log location TBD.
 
 ## P2 — `03_setup_encrypted_disks.yaml` must refuse to wipe an existing LUKS disk
 

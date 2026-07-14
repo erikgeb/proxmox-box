@@ -252,23 +252,55 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     If the .age archive is only on a USB drive / your laptop, copy it onto the box
 #     first (e.g. into the Syncthing folder) and point backup_path at that host path.
 #
-#   * Immich database (optional, recommended): the DB holds the CURATED metadata —
-#     albums, manual tags, named people (faces are re-detected on restore, but the
-#     names you assigned are lost), favorites/archive flags, descriptions, stacks,
-#     shared links. Everything else (thumbnails, transcodes, face detection, search
-#     embeddings) is regenerated from the originals on restore, so it is lower
-#     priority than the photos themselves. Turn on Immich's built-in periodic DB
-#     backup with the optional playbook below — it writes pg_dumps into
-#     immich_data/backups/, which the photo rsync above already carries to USB, so
-#     the catalog gets off-box for free. The dump is metadata only (no photos), so
-#     it stays small (hundreds of MB to ~1-2 GB even for a large library — it scales
-#     with asset/face count, not photo bytes).
+#   * Immich database: the DB holds the CURATED metadata — albums, manual tags,
+#     named people (faces are re-detected on restore, but the names you assigned
+#     are lost without the DB), favorites/archive flags, descriptions, stacks,
+#     shared links — AND the expensive derived state: face detection and
+#     smart-search embeddings for the WHOLE library. All of it can be regenerated
+#     from the originals, but re-indexing a large library costs many hours of
+#     CPU/iGPU time; a restorable dump turns that into minutes. Backed up by
+#     ansible/backup_immich.yaml: a logical pg_dumpall (no service stop — it is
+#     consistent on a live DB), gzipped and age-encrypted into a Syncthing-shared
+#     folder — the SAME artifact, pipeline and age recipient as the pre-bump dump
+#     update_docker_stack.yaml takes before an Immich version bump, so ONE offline
+#     private key decrypts every Immich DB dump. Whichever of the two runs first
+#     generates the keypair and PRINTS THE PRIVATE KEY ONCE — store it OFFLINE,
+#     exactly like the vault key above (run manually once before scheduling).
+#       ansible-playbook ansible/backup_immich.yaml -e syncthing_drop_dir=/mnt/pve/secure-storage/syncthing_share/immich_db_backups
+#     Good cron candidate — same scheduling notes (absolute ansible-playbook path,
+#     macOS caveats) as backup_vaultwarden.yaml above. Both playbooks prune the
+#     same immich-db-*.sql.gz.age pool to keep_db_backups (default 3). The dump is
+#     metadata only (no photos), so it stays small (hundreds of MB to ~1-2 GB even
+#     for a large library — it scales with asset/face count, not photo bytes).
+#
+#     Belt-and-braces alternative: Immich's built-in periodic DB backup — it
+#     writes plain pg_dumps into immich_data/backups/, which the photo rsync
+#     above already carries to USB, so the catalog gets off-box for free (though
+#     unencrypted-at-source and on the box's own schedule, not yours):
 #       # one-time: create an Immich ADMIN API key (Account Settings -> API Keys),
 #       # then copy ansible/resources/immich.env.example -> immich.env and paste it in.
 #       ansible-playbook ansible/bootstrap/99_optional_immich_db_backup.yaml
 #     Defaults: Saturday 23:00 (cron `0 23 * * 6`), keep the last 8 dumps. Override
 #     with -e backup_cron='...' / -e keep_amount=N. It is non-destructive (GET ->
 #     merge only backup.database -> PUT) and leaves the Settings UI editable.
+#
+#     RESTORE (automated — ansible/recovery/recover_immich.yaml): DESTRUCTIVE (the
+#     live Immich DB is overwritten; every catalog change since the backup is lost
+#     — photo files are NOT touched), so it asks for confirmation (type RESTORE).
+#     It stages + validates the dump first (a bad key/file aborts with zero
+#     downtime), stops the Immich services + DB (Caddy/Syncthing stay up),
+#     snapshots the CURRENT DB data dir to immich_db_backups/pre-restore-<ts>,
+#     re-inits a FRESH Postgres, loads the dump, restarts the stack and
+#     health-checks /api/server/ping — auto-rolling the pre-restore snapshot back
+#     if the restored DB fails to come up. It accepts all three backup shapes:
+#     an encrypted immich-db-*.sql.gz.age (pass the OFFLINE key), a plain *.sql.gz
+#     from Immich's built-in backup (no key), or a raw pre-restore-<ts>/data
+#     data-dir snapshot (no key; same postgres image only). The deployed Immich
+#     must be the SAME or NEWER than the dump's version (it is in the filename) —
+#     migrations only run forward. backup_path is a HOST path:
+#       ansible-playbook ansible/recovery/recover_immich.yaml \
+#         -e backup_path=/mnt/pve/secure-storage/syncthing_share/immich_db_backups/immich-db-<ts>_<ver>.sql.gz.age \
+#         -e age_identity_file=~/secrets/immich-db-age-key.txt
 
 # Maintenance & upgrades (recurrent)
 #
@@ -322,9 +354,11 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     into that Syncthing-shared folder (so it auto-syncs off-box, like the vault
 #     backup); the bump aborts if the dump fails. This guards the IRREVERSIBLE
 #     DB migration an Immich major can run (e.g. 2.x -> 3.0 pgvecto.rs ->
-#     VectorChord). It does NOT auto-roll back; the success output prints the
-#     manual restore. First run prints an age PRIVATE key ONCE — store it OFFLINE
-#     (decrypts every Immich DB dump; restore: age -d -i <key> ... | gunzip | psql).
+#     VectorChord). It does NOT auto-roll back; if the migration fails, re-pin
+#     the old version (and postgres tag), then restore the pre-bump dump with
+#     ansible/recovery/recover_immich.yaml (see the backup section above). First
+#     run prints an age PRIVATE key ONCE — store it OFFLINE (it decrypts every
+#     Immich DB dump, including backup_immich.yaml's, which shares the recipient).
 #     Create the Syncthing folder in the UI first so Syncthing owns it.
 #
 #   * VaultWarden upgrades: ansible/update_vaultwarden.yaml (see above).

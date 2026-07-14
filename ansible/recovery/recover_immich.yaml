@@ -1,0 +1,489 @@
+---
+# Recovery task: restore the Immich DATABASE from a previous backup.
+#
+# This is the counterpart to backup_immich.yaml (and to the pre-bump dump that
+# update_docker_stack.yaml takes before an Immich version bump). It is
+# DESTRUCTIVE: it replaces the live Immich DB with the chosen backup, so EVERY
+# catalog change since that backup is lost (new uploads' metadata, album edits,
+# named people, tags). The photo ORIGINALS on disk are NOT touched — after the
+# restore Immich reconciles the library against the restored catalog. Because it
+# is destructive it refuses to run without an explicit confirmation (type
+# RESTORE, or pass -e force=true).
+#
+# It accepts every backup shape this repo produces, chosen by backup_path:
+#   * an age-ENCRYPTED dump (immich-db-*.sql.gz.age) from backup_immich.yaml or
+#     update_docker_stack.yaml — requires the OFFLINE key (-e age_identity_file=);
+#   * a PLAIN gzipped dump (*.sql.gz), e.g. Immich's built-in periodic backup
+#     under immich_data/backups/ (99_optional_immich_db_backup.yaml) — no key;
+#   * a raw Postgres DATA DIRECTORY snapshot (a directory path), e.g. the
+#     pre-restore-<ts>/data snapshot this playbook itself leaves behind — no key,
+#     but ONLY valid with the SAME postgres image that wrote it.
+#
+# VERSION RULE for dumps: the deployed Immich must be the SAME or NEWER than the
+# Immich that made the dump (the version is in the filename) — on first start the
+# server migrates the restored DB forward; it can never migrate backward. To also
+# roll BACK an Immich version bump: first re-pin the old version (re-set the
+# postgres tag in docker-compose.yml if the bump changed it, then
+# update_docker_stack.yaml -e immich_version=<old> ...), then restore the
+# pre-bump dump with this playbook.
+#
+# Reversible by default: before overwriting, it snapshots the CURRENT DB data
+# dir to immich_db_backups/pre-restore-<ts>/data, and if the restored DB fails
+# the /api/server/ping health check it AUTOMATICALLY rolls that snapshot back
+# and fails loudly — so a bad restore is recoverable, not a second data loss.
+#
+# Restore procedure (Immich's documented one): stop the Immich services + DB,
+# snapshot then EMPTY the immich_db data dir, start a FRESH Postgres (re-inits
+# from the same .env credentials), load the dump with psql, start the stack.
+# A fresh cluster — rather than loading over the existing one — is what makes
+# this work even after a failed/partial migration or a Postgres image swap.
+#
+# Self-contained, like recover_vaultwarden.yaml.
+#
+# Usage:
+#   # restore an encrypted dump (needs the offline private key):
+#   ansible-playbook ansible/recovery/recover_immich.yaml \
+#     -e backup_path=/mnt/pve/secure-storage/syncthing_share/immich_db_backups/immich-db-<ts>_<ver>.sql.gz.age \
+#     -e age_identity_file=~/secrets/immich-db-age-key.txt
+#
+#   # restore Immich's own built-in periodic dump (no key needed):
+#   ansible-playbook ansible/recovery/recover_immich.yaml \
+#     -e backup_path=/mnt/pve/secure-storage/immich_data/backups/<dump>.sql.gz
+#
+#   # undo a previous restore (raw data-dir snapshot, no key needed):
+#   ansible-playbook ansible/recovery/recover_immich.yaml \
+#     -e backup_path=/mnt/pve/secure-storage/immich_db_backups/pre-restore-<ts>/data
+#
+# Notes:
+#   * backup_path is a path on the PROXMOX HOST (not the controller). If the
+#     archive only exists on a USB drive / your laptop, copy it onto the box
+#     first (e.g. into the Syncthing folder) and point backup_path at that.
+#   * age_identity_file IS a CONTROLLER path (your laptop, where the offline key
+#     lives). It is copied to a transient 0600 file on the host only for the
+#     decrypt and is shredded immediately after.
+- name: Recover the Immich database from a previous backup
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Keep in sync with 04/05_*docker*.yaml, update_docker_stack.yaml and
+    # backup_immich.yaml (these magic values are duplicated, not shared).
+    container_id: 100
+    secure_storage_path: /mnt/pve/secure-storage
+    compose_dir: /opt/docker-stack
+    db_subdir: immich_db
+    immich_postgres_container: immich_postgres
+    immich_port: 2283
+    backups_root: "{{ secure_storage_path }}/immich_db_backups"
+    # Staging lives on secure-storage so the SAME directory is visible inside
+    # LXC 100 (mp0 binds the whole volume to /mnt/storage) — that is how the
+    # plaintext dump reaches `docker exec -i psql` without pct-push gymnastics.
+    # It sits at the VOLUME ROOT (not under immich_db_backups, which is 0700
+    # host-root and thus untraversable across the id-shift): container root
+    # (host 100000) can traverse the volume root — Docker already resolves its
+    # bind-mount paths through it — and the staging dir is chowned to 100000.
+    staging_dir: "{{ secure_storage_path }}/.immich-restore-staging"
+    staging_dir_ct: /mnt/storage/.immich-restore-staging
+    identity_tmp: /root/.immich-restore-identity   # transient host copy of the age key; shredded in `always`
+    # Pre-restore data-dir snapshots can be GBs each (they hold the vector
+    # indexes), so keep fewer than the vault's equivalent.
+    keep_pre_restore: 2
+    force: false
+    # backup_path is REQUIRED via -e (host path): *.sql.gz.age | *.sql.gz | a
+    #   raw Postgres data directory.
+    # age_identity_file is REQUIRED via -e only when backup_path ends in .age.
+
+  tasks:
+    # --- Phase 1: validate inputs & preconditions ---------------------------
+    - name: Fail if backup_path was not provided
+      ansible.builtin.fail:
+        msg: "backup_path is required. Pass -e backup_path=<host path to an immich-db-*.sql.gz.age, a plain *.sql.gz dump, or a raw Postgres data directory>."
+      when: backup_path is undefined or (backup_path | length == 0)
+
+    - name: Check whether the encrypted secure storage is currently mounted
+      ansible.builtin.command: "mountpoint -q {{ secure_storage_path }}"
+      register: secure_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if secure storage is not mounted
+      ansible.builtin.fail:
+        msg: "{{ secure_storage_path }} is not a mount point. Run unlock_storage.yaml first — the DB data and the staging dir live on the encrypted volume."
+      when: secure_mount_check.rc != 0
+
+    - name: Confirm the backup path exists on the host
+      ansible.builtin.stat:
+        path: "{{ backup_path }}"
+      register: backup_stat
+
+    - name: Fail if the backup path does not exist
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} does not exist on the host. backup_path must be a path on the Proxmox host (copy the archive onto the box first if it is only on a USB drive / your laptop)."
+      when: not backup_stat.stat.exists
+
+    # Mode selection: directory => raw data-dir snapshot; .age => encrypted
+    # dump; .sql.gz => plain dump; anything else is refused.
+    - name: Determine the backup mode
+      ansible.builtin.set_fact:
+        backup_is_dir: "{{ backup_stat.stat.isdir }}"
+        backup_is_encrypted: "{{ (not backup_stat.stat.isdir) and (backup_path is match('.*\\.age$')) }}"
+
+    - name: Fail if a file backup has an unrecognized extension
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} is neither a directory, a .sql.gz dump, nor a .sql.gz.age archive. Refusing to guess what it is."
+      when: not backup_is_dir and not backup_is_encrypted and not (backup_path is match('.*\\.sql\\.gz$'))
+
+    - name: Fail if an encrypted backup was given without an identity file
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} is age-encrypted but no age_identity_file was given. Pass -e age_identity_file=<controller path to the OFFLINE private key>."
+      when: backup_is_encrypted and (age_identity_file is undefined or (age_identity_file | length == 0))
+
+    # A Postgres data dir always carries PG_VERSION — validate BEFORE stopping
+    # anything (dump-mode validation happens after staging, below).
+    - name: Confirm a data-dir backup looks like a Postgres data directory
+      ansible.builtin.stat:
+        path: "{{ backup_path }}/PG_VERSION"
+      register: pg_version_stat
+      when: backup_is_dir
+
+    - name: Fail if the data-dir backup has no PG_VERSION
+      ansible.builtin.fail:
+        msg: "{{ backup_path }} has no PG_VERSION — it does not look like a Postgres data directory (expected e.g. a pre-restore-<ts>/data snapshot). Refusing to restore it."
+      when: backup_is_dir and not pg_version_stat.stat.exists
+
+    - name: Check the Docker LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Docker LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 04_provision_docker_lxc.yaml / 05_deploy_docker_stack.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the Docker LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    - name: Fail if the stack has not been deployed yet (.env missing — run 05 first)
+      ansible.builtin.command: "pct exec {{ container_id }} -- test -f {{ compose_dir }}/.env"
+      register: env_check
+      changed_when: false
+      failed_when: env_check.rc != 0
+
+    - name: Resolve the DB superuser from the live .env
+      ansible.builtin.command: "pct exec {{ container_id }} -- bash -lc 'grep -E ^DB_USERNAME= {{ compose_dir }}/.env | cut -d= -f2'"
+      register: db_user_probe
+      changed_when: false
+
+    # The health check runs from the controller against the LXC's LAN IP —
+    # probe it now so a probe failure aborts BEFORE anything destructive.
+    - name: Probe the Docker LXC's LAN IP (for the health check)
+      ansible.builtin.command: "pct exec {{ container_id }} -- ip -4 -o addr show eth0"
+      register: ip_probe
+      changed_when: false
+
+    - name: Compute the DB superuser and the LXC IP
+      ansible.builtin.set_fact:
+        db_username: "{{ db_user_probe.stdout | trim }}"
+        immich_lxc_ip: "{{ ip_probe.stdout | regex_search('inet ([0-9.]+)', '\\1') | first }}"
+
+    - name: Ensure age is installed on the host (encrypted backups only)
+      ansible.builtin.apt:
+        name: age
+        state: present
+        update_cache: yes
+      when: backup_is_encrypted
+
+    # --- Phase 2: stage + validate the backup (BEFORE any destructive step) --
+    # Decrypt/gunzip the dump into staging first and sanity-check it. This way a
+    # bad path, wrong key, or non-Immich archive fails with the live DB still
+    # untouched and the stack still running — no downtime, nothing to undo.
+    # (Data-dir mode was already validated above and is copied directly in the
+    # swap step — no point duplicating GBs into staging first.)
+    - name: Stage and validate the backup, then restore it
+      block:
+        - name: Reset a clean staging directory
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: "{{ item }}"
+            mode: "0700"
+          loop:
+            - absent
+            - directory
+          when: not backup_is_dir
+
+        - name: Copy the age identity to a transient host file (encrypted only)
+          ansible.builtin.copy:
+            src: "{{ age_identity_file }}"
+            dest: "{{ identity_tmp }}"
+            mode: "0600"
+          when: backup_is_encrypted
+
+        # The plaintext dump lands on the encrypted volume only (staging), never
+        # anywhere unencrypted.
+        - name: Decrypt and decompress the encrypted dump into staging
+          ansible.builtin.shell:
+            cmd: "set -o pipefail && age -d -i {{ identity_tmp }} {{ backup_path | quote }} | gunzip > {{ staging_dir }}/dump.sql"
+            executable: /bin/bash
+          register: decrypt
+          changed_when: decrypt.rc == 0
+          when: backup_is_encrypted
+
+        - name: Decompress the plain dump into staging
+          ansible.builtin.shell:
+            cmd: "set -o pipefail && gunzip -c {{ backup_path | quote }} > {{ staging_dir }}/dump.sql"
+            executable: /bin/bash
+          register: gunzip_plain
+          changed_when: gunzip_plain.rc == 0
+          when: not backup_is_dir and not backup_is_encrypted
+
+        # pg_dumpall always starts with this banner — guards against a wrong
+        # file (e.g. a vault-*.age, which would gunzip fine but is a tarball).
+        - name: Confirm the staged dump is a Postgres cluster dump
+          ansible.builtin.command: "grep -q 'PostgreSQL database cluster dump' {{ staging_dir }}/dump.sql"
+          register: dump_check
+          changed_when: false
+          failed_when: false
+          when: not backup_is_dir
+
+        - name: Fail if the staged dump is not a Postgres cluster dump
+          ansible.builtin.fail:
+            msg: "The staged file does not look like a pg_dumpall dump — refusing to overwrite the live DB. (Wrong file? A vault backup? A corrupt archive?)"
+          when: not backup_is_dir and dump_check.rc != 0
+
+        # Immich's documented restore rewrites the dump's search_path preamble
+        # so the vector extension's operators resolve during the data load.
+        - name: Fix the search_path preamble for the vector extensions
+          ansible.builtin.shell:
+            cmd: >-
+              sed -i "s/SELECT pg_catalog.set_config('search_path', '', false);/SELECT pg_catalog.set_config('search_path', 'public, pg_catalog', true);/g" {{ staging_dir }}/dump.sql
+            executable: /bin/bash
+          register: sed_fix
+          changed_when: sed_fix.rc == 0
+          when: not backup_is_dir
+
+        # The dump is read from INSIDE the container (via the /mnt/storage bind
+        # mount), where host-root ownership maps to nobody — re-own to 100000
+        # (container root) so `bash -c '... < dump.sql'` in the CT can read it.
+        - name: Make the staged dump readable from inside the container
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            owner: "100000"
+            group: "100000"
+            mode: "{{ item.mode }}"
+          loop:
+            - { path: "{{ staging_dir }}", mode: "0700" }
+            - { path: "{{ staging_dir }}/dump.sql", mode: "0600" }
+          when: not backup_is_dir
+
+        # --- Phase 3: confirmation (last chance before destruction) ----------
+        - name: Confirm the destructive restore
+          ansible.builtin.pause:
+            prompt: |
+
+              ============================ DESTRUCTIVE RESTORE ============================
+              About to OVERWRITE the live Immich database on container {{ container_id }}:
+                from backup : {{ backup_path }}
+                into        : {{ secure_storage_path }}/{{ db_subdir }}
+
+              EVERY catalog change since this backup WILL BE LOST (metadata of newer
+              uploads, album edits, named people, tags). Photo files are NOT touched.
+              For a dump, the deployed Immich must be the SAME or NEWER version than
+              the one in the dump's filename; a data-dir snapshot must match the SAME
+              postgres image that wrote it.
+              (The current DB is first snapshotted to {{ backups_root }}/pre-restore-<ts>
+              and is rolled back automatically if the restore fails its health check.)
+
+              Type RESTORE to proceed, anything else to abort:
+          register: confirm
+          when: not (force | bool)
+
+        - name: Abort unless the restore was confirmed
+          ansible.builtin.fail:
+            msg: "Restore not confirmed (you did not type RESTORE). Aborting with the live DB untouched."
+          when: not (force | bool) and (confirm.user_input | default('') | trim) != 'RESTORE'
+
+        # --- Phase 4: stop, snapshot current, swap in the backup -------------
+        # Caddy/Syncthing keep running; only the Immich services and the DB stop.
+        - name: Stop the Immich services and the database
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose stop immich-server immich-machine-learning database'"
+          register: stop_svcs
+          changed_when: stop_svcs.rc == 0
+
+        - name: Timestamp for the pre-restore safety snapshot
+          ansible.builtin.command: date +%Y%m%d-%H%M%S
+          register: ts_cmd
+          changed_when: false
+
+        - name: Compute the pre-restore snapshot path
+          ansible.builtin.set_fact:
+            pre_restore_dir: "{{ backups_root }}/pre-restore-{{ ts_cmd.stdout }}"
+
+        - name: Create the pre-restore snapshot directory
+          ansible.builtin.file:
+            path: "{{ pre_restore_dir }}"
+            state: directory
+            mode: "0700"
+
+        # Postgres is stopped, so a file copy is consistent. cp -a preserves the
+        # id-shifted ownership, making this snapshot directly restorable (it is
+        # exactly the data-dir shape this playbook accepts as backup_path).
+        - name: Snapshot the CURRENT DB data dir (so the restore is reversible)
+          ansible.builtin.command: "cp -a {{ secure_storage_path }}/{{ db_subdir }} {{ pre_restore_dir }}/data"
+          register: pre_snap
+          changed_when: pre_snap.rc == 0
+
+        # Empty the CONTENTS in place — never `rm -rf` the directory itself: it
+        # is a bind-mount source (LXC 100's mp0 parent AND the postgres
+        # container's bind mount), and mounts pin the directory INODE. The
+        # emptied dir keeps its ownership, so the fresh initdb can write.
+        - name: Empty the live DB data dir (fresh cluster for the dump load)
+          ansible.builtin.command: "find {{ secure_storage_path }}/{{ db_subdir }} -mindepth 1 -delete"
+          register: wipe_db
+          changed_when: wipe_db.rc == 0
+
+        # Dump mode: bring up an EMPTY Postgres (the entrypoint re-inits the
+        # cluster from the same .env credentials), then load the dump into it.
+        - name: Start a fresh Postgres on the emptied data dir (dump mode)
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose up -d database'"
+          register: fresh_db
+          changed_when: fresh_db.rc == 0
+          when: not backup_is_dir
+
+        - name: Wait for the fresh Postgres to be ready (dump mode)
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- docker exec {{ immich_postgres_container }} pg_isready -U {{ db_username }}"
+          register: pg_ready
+          changed_when: false
+          retries: 20
+          delay: 3
+          until: pg_ready.rc == 0
+          when: not backup_is_dir
+
+        # psql reads the staged dump through the container's /mnt/storage bind
+        # mount. stdout (one line per statement) is discarded; errors still
+        # surface on stderr. The /api/server/ping health check below is the
+        # real success gate.
+        - name: Load the dump into the fresh database (dump mode)
+          ansible.builtin.command:
+            cmd: >-
+              pct exec {{ container_id }} -- bash -c
+              'set -o pipefail;
+              docker exec -i {{ immich_postgres_container }} psql --username={{ db_username }} --dbname=postgres
+              < {{ staging_dir_ct }}/dump.sql > /dev/null'
+          register: psql_load
+          changed_when: psql_load.rc == 0
+          when: not backup_is_dir
+
+        # Data-dir mode: no fresh init — copy the snapshot's contents in
+        # (cp -a preserves the id-shifted postgres ownership) and start it.
+        - name: Copy the data-dir snapshot into the live DB data dir (data-dir mode)
+          ansible.builtin.command: "cp -a {{ backup_path }}/. {{ secure_storage_path }}/{{ db_subdir }}/"
+          register: dir_copy
+          changed_when: dir_copy.rc == 0
+          when: backup_is_dir
+
+        - name: Start the full stack on the restored database
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose up -d'"
+          register: stack_up
+          changed_when: stack_up.rc == 0
+
+        # Health check from the controller (on the LAN) — catches a restored DB
+        # the server cannot open or migrate. First start after a dump restore
+        # re-runs forward migrations, so allow a few minutes.
+        - name: Wait for Immich to answer /api/server/ping on the restored DB
+          ansible.builtin.uri:
+            url: "http://{{ immich_lxc_ip }}:{{ immich_port }}/api/server/ping"
+            status_code: 200
+          delegate_to: localhost
+          become: no
+          register: health
+          retries: 40
+          delay: 5
+          until: health.status == 200
+
+      rescue:
+        # If we never got as far as snapshotting/swapping (e.g. bad key, no
+        # confirmation), pre_restore_dir is unset and the live DB was never
+        # touched — just report. Otherwise roll the pre-restore snapshot back.
+        - name: Report the failure
+          ansible.builtin.debug:
+            msg: "Restore failed. {{ 'Rolling back the pre-restore snapshot from ' + pre_restore_dir if pre_restore_dir is defined else 'The live database was never modified.' }}"
+
+        - name: Stop the (possibly broken) services before rollback
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose stop immich-server immich-machine-learning database'"
+          changed_when: false
+          failed_when: false
+          when: pre_restore_dir is defined
+
+        # Same in-place content swap as the restore itself: the directory is a
+        # live bind-mount source, so its inode must survive the rollback.
+        - name: Roll the pre-restore snapshot back to the live DB data dir
+          ansible.builtin.command:
+            cmd: >-
+              bash -c '
+              set -euo pipefail;
+              find {{ secure_storage_path }}/{{ db_subdir }} -mindepth 1 -delete;
+              cp -a {{ pre_restore_dir }}/data/. {{ secure_storage_path }}/{{ db_subdir }}/
+              '
+          changed_when: true
+          when: pre_restore_dir is defined
+
+        - name: Restart the stack on the rolled-back database
+          ansible.builtin.command:
+            cmd: "pct exec {{ container_id }} -- bash -lc 'cd {{ compose_dir }} && docker compose up -d'"
+          changed_when: true
+          failed_when: false
+          when: pre_restore_dir is defined
+
+        - name: Fail the play after the restore attempt
+          ansible.builtin.fail:
+            msg: >-
+              Immich DB restore from {{ backup_path }} FAILED.
+              {{ 'The pre-restore snapshot was rolled back (retained at ' + pre_restore_dir + ') and the previous database restarted.' if pre_restore_dir is defined else 'The live database was never modified.' }}
+              Investigate: pct exec {{ container_id }} -- docker logs immich_server
+              and: pct exec {{ container_id }} -- docker logs {{ immich_postgres_container }}
+
+      always:
+        # The transient key copy must never linger on the box — shred + remove
+        # it regardless of success/failure. Staging holds a plaintext dump
+        # (account hashes + personal metadata), so clear it too.
+        - name: Shred and remove the transient age identity copy
+          ansible.builtin.command: "shred -u {{ identity_tmp }}"
+          changed_when: false
+          failed_when: false
+          when: backup_is_encrypted
+
+        - name: Remove the staging directory
+          ansible.builtin.file:
+            path: "{{ staging_dir }}"
+            state: absent
+
+    # --- Phase 5: success housekeeping + report -----------------------------
+    # Scoped to pre-restore-* so it never touches the age recipient or anything
+    # else under immich_db_backups. The just-created pre_restore_dir is the
+    # newest, so it always survives the prune.
+    - name: Prune old pre-restore snapshots (keep the most recent N)
+      ansible.builtin.command:
+        cmd: >-
+          bash -c '
+          cd {{ backups_root }} && ls -1dt pre-restore-*/ 2>/dev/null | tail -n +{{ keep_pre_restore + 1 }} | xargs -r rm -rf
+          '
+      changed_when: false
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg:
+          - "Immich DB restored from {{ backup_path }} and the server is answering /api/server/ping."
+          - "The DB as it was just before this restore is snapshotted at {{ pre_restore_dir }}/data — undo this restore by re-running with -e backup_path={{ pre_restore_dir }}/data (pre-restore snapshots are pruned to the {{ keep_pre_restore }} most recent)."
+          - "Sanity-check the library in the web UI (albums, people, search). If assets uploaded AFTER the backup show as missing metadata, run the 'Refresh library files' / external-library scan from the admin jobs page to reconcile."
