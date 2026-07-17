@@ -1,0 +1,202 @@
+---
+# One-time host hardening: encrypt the Proxmox host's swap with an EPHEMERAL
+# key (plain dm-crypt, a fresh random key from /dev/urandom on every boot).
+#
+# Why: LUKS protects the DATA disk at rest, but swap lives on the unencrypted
+# BOOT disk (default PVE install: the /dev/pve/swap LV). Any anonymous process
+# page the kernel swaps out — Caddy's TLS private key, Postgres work memory,
+# app heaps from every LXC (container memory is host memory) — persists there
+# in cleartext across poweroff: exactly the physical-theft scenario the LUKS
+# setup defends against. (The LUKS master key itself is NOT at risk: it lives
+# in kernel memory, which is never swapped; cryptsetup also mlocks the
+# passphrase while unlocking.)
+#
+# Why an ephemeral key, not a passphrase: swap contents are worthless across
+# reboots, so nothing needs to survive one. A fresh /dev/urandom key per boot
+# means NO extra boot-time interaction — it composes with the unattended-VPN /
+# manual-LUKS-unlock design instead of adding a second unlock step. The only
+# casualty is hibernation, which this headless box does not use.
+#
+# Idempotent: if /etc/crypttab already carries the entry, the destructive
+# conversion steps (swapoff + wipe) are skipped and the config/activation
+# tasks are no-ops. Safe to run on an existing install at any time.
+#
+# Rollback (manual): remove the cryptswap line from /etc/crypttab, point the
+# fstab swap line back at the raw device, then:
+#   swapoff -a && cryptsetup close cryptswap && mkswap <device> && swapon -a
+#
+# Usage:
+#   ansible-playbook ansible/bootstrap/11_encrypt_swap.yaml
+#   ansible-playbook ansible/bootstrap/11_encrypt_swap.yaml -e swap_device=/dev/pve/swap
+- name: Encrypt the Proxmox host swap with an ephemeral per-boot key
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Repo-internal name of the dm-crypt mapping (deliberately in play vars —
+    # see the group_vars convention in CLAUDE.md).
+    crypt_name: cryptswap
+
+  tasks:
+    # swap_device is deployment-specific, so it is NOT in play vars (which
+    # would shadow group_vars); default it once here instead of at every use.
+    - name: Resolve the swap device (override with -e swap_device=...)
+      ansible.builtin.set_fact:
+        swap_dev: "{{ swap_device | default('/dev/pve/swap') }}"
+
+    # --- Phase 1: probes + guards --------------------------------------------
+    - name: Check whether crypttab already carries the encrypted-swap entry
+      ansible.builtin.command: "grep -E '^{{ crypt_name }}\\s' /etc/crypttab"
+      register: crypttab_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Read the current fstab swap entries
+      ansible.builtin.command: "grep -E '^[^#]\\S*\\s+\\S+\\s+swap\\s' /etc/fstab"
+      register: fstab_swap
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the swap device exists
+      ansible.builtin.stat:
+        path: "{{ swap_dev }}"
+        follow: yes
+      register: swap_dev_stat
+
+    - name: Report and stop if the host has no swap at all
+      when:
+        - not swap_dev_stat.stat.exists
+        - fstab_swap.rc != 0
+        - crypttab_probe.rc != 0
+      block:
+        - name: Nothing to encrypt
+          ansible.builtin.debug:
+            msg: "No swap device ({{ swap_dev }}) and no fstab swap entry found — this host runs without swap; nothing to encrypt."
+        - name: End the play
+          ansible.builtin.meta: end_play
+
+    - name: Fail if the swap device does not exist
+      ansible.builtin.fail:
+        msg: >-
+          {{ swap_dev }} not found, but /etc/fstab does configure swap
+          ({{ fstab_swap.stdout_lines | default([]) }}). This playbook expects
+          the Proxmox default LVM swap volume — inspect `swapon --show` and
+          /etc/fstab on the host and pass the real block device with
+          -e swap_device=...
+      when: not swap_dev_stat.stat.exists
+
+    # Refuse to guess when fstab references the swap some other way (UUID=...,
+    # a different device): the lineinfile edit below would then ADD a second
+    # swap entry instead of replacing the plaintext one.
+    - name: Fail if the fstab swap entry does not reference the expected device
+      ansible.builtin.fail:
+        msg: >-
+          /etc/fstab has no swap line referencing {{ swap_dev }} or
+          /dev/mapper/{{ crypt_name }} (found: {{ fstab_swap.stdout_lines | default([]) }}).
+          Refusing to guess — pass the device fstab actually uses with
+          -e swap_device=... (a UUID= reference must first be rewritten to its
+          /dev path by hand).
+      when:
+        - swap_dev not in fstab_swap.stdout
+        - ('/dev/mapper/' ~ crypt_name) not in fstab_swap.stdout
+
+    # --- Phase 2: one-time conversion (skipped once crypttab is in place) ----
+    - name: Convert the plaintext swap (first run only)
+      when: crypttab_probe.rc != 0
+      block:
+        # Fails with ENOMEM if the swapped-out pages don't fit back into RAM —
+        # in that case free memory (stop a container) and re-run. "Invalid
+        # argument" just means the device was not active as swap; carry on.
+        - name: Deactivate the plaintext swap
+          ansible.builtin.command: "swapoff {{ swap_dev }}"
+          register: swapoff_res
+          changed_when: swapoff_res.rc == 0
+          failed_when:
+            - swapoff_res.rc != 0
+            - "'Invalid argument' not in swapoff_res.stderr"
+
+        # Everything ever swapped out is still sitting in this LV in cleartext;
+        # the new encrypted mapping only overwrites blocks as they get reused.
+        # Purge it once: discard if the SSD supports it, else overwrite. (dd
+        # exits 1 when it fills the device — that is the success case here.)
+        - name: Purge residual cleartext from the old swap area
+          ansible.builtin.shell: |
+            if blkdiscard -f {{ swap_dev }} 2>/dev/null; then
+              echo WIPED=discard
+            else
+              dd if=/dev/zero of={{ swap_dev }} bs=4M oflag=direct 2>/dev/null
+              case $? in 0|1) echo WIPED=zero ;; *) exit 1 ;; esac
+            fi
+          args:
+            executable: /bin/bash
+          register: wipe
+          changed_when: true
+          failed_when: wipe.rc != 0 or 'WIPED=' not in wipe.stdout
+
+    # --- Phase 3: config (idempotent) -----------------------------------------
+    # plain dm-crypt keyed from /dev/urandom; the `swap` option re-runs mkswap
+    # on the fresh mapping every boot. size=512 -> AES-256 in XTS mode. discard
+    # keeps TRIM working through the crypt layer (fine with an ephemeral key).
+    - name: Configure the encrypted swap mapping in /etc/crypttab
+      ansible.builtin.lineinfile:
+        path: /etc/crypttab
+        create: yes
+        owner: root
+        group: root
+        mode: "0644"
+        regexp: '^{{ crypt_name }}\s'
+        line: "{{ crypt_name }} {{ swap_dev }} /dev/urandom swap,plain,cipher=aes-xts-plain64,size=512,discard"
+      register: crypttab_edit
+
+    # nofail: a swap that fails to come up must degrade to "no swap", never
+    # block boot (a hung boot needs physical access — the failure mode this
+    # box's remote-unlock design exists to avoid).
+    - name: Point the fstab swap entry at the encrypted mapper
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^({{ swap_dev | regex_escape }}|/dev/mapper/{{ crypt_name }})\s+\S+\s+swap\s'
+        line: "/dev/mapper/{{ crypt_name }} none swap sw,nofail 0 0"
+      register: fstab_edit
+
+    # --- Phase 4: activate now (no reboot) + verify ---------------------------
+    - name: Reload systemd so the crypttab/fstab generators pick up the change
+      ansible.builtin.systemd:
+        daemon_reload: yes
+      when: crypttab_edit.changed or fstab_edit.changed
+
+    - name: Start the encrypted swap mapping
+      ansible.builtin.command: "systemctl start systemd-cryptsetup@{{ crypt_name }}.service"
+      register: crypt_start
+      changed_when: crypttab_probe.rc != 0
+
+    - name: Activate swap from fstab
+      ansible.builtin.command: swapon -a
+      register: swapon_res
+      changed_when: crypttab_probe.rc != 0
+
+    # Both paths are symlinks to /dev/dm-N nodes, and /proc/swaps lists the
+    # resolved node — compare resolved paths on both sides.
+    - name: Verify encrypted swap is active and the plaintext swap is gone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cryptsetup status {{ crypt_name }} | grep -Eq 'type: +PLAIN'
+        enc=$(readlink -f /dev/mapper/{{ crypt_name }})
+        awk -v d="$enc" '$1 == d {found=1} END {exit !found}' /proc/swaps
+        raw=$(readlink -f {{ swap_dev }})
+        if awk -v d="$raw" '$1 == d {found=1} END {exit !found}' /proc/swaps; then
+          echo "plaintext swap is still active on {{ swap_dev }}" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Host swap now runs over plain dm-crypt with a fresh /dev/urandom key every boot ({{ swap_dev }} -> /dev/mapper/{{ crypt_name }})."
+          - "Survives reboots unattended (no passphrase); hibernation is not supported (not used on this box)."
+          - "Verify anytime with: swapon --show  and  cryptsetup status {{ crypt_name }}"
+          - "Rollback: remove the {{ crypt_name }} line from /etc/crypttab, point the fstab swap line back at {{ swap_dev }}, then swapoff -a && cryptsetup close {{ crypt_name }} && mkswap {{ swap_dev }} && swapon -a"

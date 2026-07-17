@@ -21,6 +21,17 @@ ansible-playbook ansible/bootstrap/02_remove_nag_msg.yaml
 # Warning: this will wipe the targeted disk
 ansible-playbook ansible/bootstrap/03_setup_encrypted_disks.yaml -e "target_disk=/dev/sdX"
 
+# One-time hardening: encrypt the host's SWAP with a fresh random key on every
+# boot (plain dm-crypt over the default /dev/pve/swap; -e swap_device= to
+# override). Without it, fragments of process memory (TLS private keys, app
+# data from every LXC) can persist in cleartext swap on the UNENCRYPTED boot
+# disk across poweroff — the physical-theft scenario the LUKS setup defends
+# against. No passphrase and no boot-time interaction (the key is ephemeral,
+# regenerated each boot); hibernation stops working (not used here). It also
+# purges any cleartext already left in the old swap area. Idempotent; safe to
+# run on an already-deployed box at any time, no reboot needed.
+ansible-playbook ansible/bootstrap/11_encrypt_swap.yaml
+
 # Provision the docker host LXC (runs pct as root over SSH; the encrypted storage
 # must be mounted first so the bind mount points at the encrypted volume).
 # The playbook downloads the Debian OS template on demand (pveam), but it is pinned
@@ -450,6 +461,74 @@ ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 #     the same way as the other recurrent plays, e.g. monthly: `0 4 1 * *`.
 
 ```
+
+# What to do if the box is stolen
+
+The LUKS setup is designed for exactly this event. If the box was powered off
+or the storage was still locked (its state after any reboot), everything on the
+data disk is unreadable: the photos, the Immich DB, the Syncthing files, the
+vault, Caddy's certificate + ACME account keys, and the on-box backup
+snapshots. The `.age` backup archives are additionally encrypted with keys that
+were never on the box, and the LUKS passphrase and age private keys live only
+with you — nothing about the *data* needs rotating. The **unencrypted boot
+disk**, however, leaks some things (partly by deliberate trade-off), so work
+through this checklist:
+
+1. **Close the VPN path (router + DNS).** Remove the router's IPv6 pinhole for
+   udp/51820 and delete the `vpn.<base-domain>` AAAA record. The thief has the
+   WireGuard **server** private key *and every enrolled client's config
+   including private keys* (`/etc/wireguard/clients/*.conf` — all kept on the
+   unencrypted rootfs, the accepted price of the unattended VPN). With the box
+   gone there is no server left to reach, but treat all WireGuard key material
+   as burned: when rebuilding, `10_deploy_wireguard.yaml` generates a fresh
+   server key; re-enrol every device with `add_wireguard_peer.yaml` and delete
+   the old WireGuard profiles from the devices.
+
+2. **Revoke the OVH API credential** (OVH control panel, or the token manager
+   linked from https://api.ovh.com/). It grants write access to the whole DNS
+   zone — enough to pass DNS-01 challenges and issue certificates for your
+   domain. Current deployments keep `caddy.env` on the encrypted volume
+   (`secure-storage/secrets/`), but deployments made before that change had it
+   on LXC 100's unencrypted rootfs, and it may also linger in old swap or
+   freed blocks — revoking costs a minute, so do it regardless. Create a fresh
+   credential (see the Caddy setup step above) and update the controller's
+   `ansible/resources/caddy.env`, which remains the source of truth.
+
+3. **Untrust the box's Syncthing device ID** on every peer (personal machine,
+   phones). Syncthing's own keys sit on the encrypted volume, so a thief who
+   never gets the storage unlocked cannot impersonate the box — but removing
+   the device on the peers is free and makes it impossible for a revived box
+   to reconnect through relays and receive your files.
+
+4. **Nothing to do for these, listed so you don't wonder:** the boot disk holds
+   only your *public* SSH key (the automation private key is on the
+   controller); the VaultWarden `ADMIN_TOKEN` only as an Argon2id hash of a
+   long random token (rotated anyway on a fresh `07` deploy); the Immich DB
+   password in LXC 100's `.env` (worthless without the encrypted database it
+   belongs to; regenerated on redeploy); container logs and your internal
+   hostnames (mild privacy leak only). Host swap is covered once
+   `11_encrypt_swap.yaml` has been run — if the theft happened *before* it
+   ever ran, assume swap held fragments of process memory (one more reason
+   the OVH revocation and WireGuard rekey above are unconditional).
+
+5. **Rebuild from backups.** Re-run the pipeline from `01` on new hardware,
+   then restore: the vault from the newest `vault-<ts>.age` (synced to your
+   personal machine / USB) with `recovery/recover_vaultwarden.yaml` and the
+   offline age key; the Immich DB from `immich-db-*.sql.gz.age` with
+   `recovery/recover_immich.yaml`; photo originals and Syncthing files back
+   from the USB copies.
+
+**If the box was stolen while running and unlocked**, at-rest protection was
+void (the accepted limitation of the LAN-only posture) — assume the data disk
+was readable. In addition to the list above: treat the wildcard TLS private
+key as compromised (its practical abuse is limited to impersonating your LAN
+hostnames to someone on your network, but revoke or let it age out — a rebuilt
+Caddy issues a fresh one); the vault database is still protected by your
+Bitwarden **master password** (encryption is client-side, the server only
+stores ciphertext), so if that password is strong the vault contents remain
+safe — if it is weak, change it and rotate the most sensitive credentials
+stored inside; for the photos and synced files there is nothing to rotate,
+only privacy lost.
 
 # Backlog
 
