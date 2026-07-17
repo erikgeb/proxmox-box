@@ -8,7 +8,13 @@
   vars:
     container_id: 100
     hostname: docker-srv
-    ostemplate_name: "debian-13-standard_13.1-2_amd64.tar.zst"
+    # Only the template SERIES is pinned; the point release (ostemplate_name) is
+    # resolved at run time by the "Resolve the OS template" task, because the
+    # pveam catalog only serves the CURRENT point release — a hardcoded name
+    # (13.1-2 historically) can no longer be downloaded on a fresh rebuild once
+    # superseded. Point-release determinism buys nothing anyway: guests are
+    # dist-upgraded by update_proxmox.yaml.
+    ostemplate_series: debian-13-standard
     ostemplate: "local:vztmpl/{{ ostemplate_name }}"
     # rootfs lives on the boot disk (local-lvm), NOT the encrypted volume, so the
     # container's root filesystem is not gated behind the manual LUKS unlock.
@@ -70,16 +76,40 @@
 
     # pct create needs the OS template present in `local` storage first; a fresh
     # host has none. Refresh the catalog and download on-demand (idempotent: skipped
-    # once the template is already in `pveam list`).
+    # once a template of the series is already in `pveam list`).
     - name: Refresh the appliance template catalog
       ansible.builtin.command: pveam update
       changed_when: false
       failed_when: false
 
-    - name: Check whether the OS template is already downloaded
+    - name: Check which OS templates are already downloaded
       ansible.builtin.command: "pveam list local"
       register: pveam_list
       changed_when: false
+
+    # Prefer a template of the pinned series that is already downloaded (re-runs
+    # stay offline no-ops and never re-download); otherwise take the newest one
+    # the catalog offers.
+    - name: Resolve the OS template (newest local {{ ostemplate_series }}, else newest in the catalog)
+      ansible.builtin.shell: |
+        set -o pipefail
+        tmpl=$(pveam list local | awk '{print $1}' | sed 's|.*/||' | grep "^{{ ostemplate_series }}_" | sort -V | tail -n 1)
+        if [ -z "$tmpl" ]; then
+          tmpl=$(pveam available --section system | awk '{print $2}' | grep "^{{ ostemplate_series }}_" | sort -V | tail -n 1)
+        fi
+        if [ -z "$tmpl" ]; then
+          echo "no {{ ostemplate_series }} template found locally or in the pveam catalog" >&2
+          exit 1
+        fi
+        echo "$tmpl"
+      args:
+        executable: /bin/bash
+      register: tmpl_resolve
+      changed_when: false
+
+    - name: Pin the resolved template name for this run
+      ansible.builtin.set_fact:
+        ostemplate_name: "{{ tmpl_resolve.stdout | trim }}"
 
     - name: Download the Debian OS template
       ansible.builtin.command: "pveam download local {{ ostemplate_name }}"
