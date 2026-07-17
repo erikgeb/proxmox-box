@@ -149,9 +149,9 @@
     # --- Phase 3b: Caddy reverse proxy resources -----------------------------
     # Caddy needs its build context (Dockerfile), its config (Caddyfile, bind-
     # mounted read-only) and the OVH DNS-01 credentials (caddy.env). caddy.env
-    # is user-supplied and gitignored; the "Stage caddy.env" copy task below
-    # reads it from the controller (ansible.builtin.copy) and fails loudly if it
-    # is absent, so Caddy is never brought up unable to obtain a cert. (A prior
+    # is user-supplied and gitignored; the "Copy caddy.env" task below reads it
+    # from the controller (ansible.builtin.copy) and fails loudly if it is
+    # absent, so Caddy is never brought up unable to obtain a cert. (A prior
     # ansible.builtin.stat guard here was wrong — it ran on the remote host and
     # so checked the controller-only resources path on Proxmox, where it never
     # exists; the copy task is the real, correct guard.)
@@ -191,27 +191,29 @@
       register: push_caddyfile
       changed_when: push_caddyfile.rc == 0
 
-    # caddy.env holds the OVH API secret — stage it mode 600, push with
-    # restrictive perms, then remove the host-side staging copy so the secret
-    # does not linger in /tmp.
-    - name: Stage caddy.env on the Proxmox host (mode 600)
+    # caddy.env holds the OVH API secret — a credential whose value is
+    # INDEPENDENT of this box (it grants write access to the whole DNS zone),
+    # so unlike the rest of the compose project it must NOT live on the
+    # container's unencrypted rootfs. It goes onto the ENCRYPTED volume
+    # instead (secrets/, which the container sees at /mnt/storage/secrets/ —
+    # docker-compose.yml's env_file points there by absolute path). No pct
+    # push needed: the host path IS the container path via the mp0 bind mount,
+    # and the phase-1 guard already ensured the encrypted volume is mounted.
+    - name: Ensure the secrets dir exists on the encrypted volume
+      ansible.builtin.file:
+        path: "{{ secure_storage_path }}/secrets"
+        state: directory
+        owner: "100000" # container root under the unprivileged id-shift
+        group: "100000"
+        mode: "0700"
+
+    - name: Copy caddy.env onto the encrypted volume (mode 600)
       ansible.builtin.copy:
         src: "{{ resources_dir }}/caddy.env"
-        dest: /tmp/docker-stack-caddy.env
+        dest: "{{ secure_storage_path }}/secrets/caddy.env"
+        owner: "100000"
+        group: "100000"
         mode: "0600"
-
-    - name: Push caddy.env into the container (mode 600, and verify it landed)
-      ansible.builtin.command:
-        cmd: >-
-          bash -c 'pct push {{ container_id }} /tmp/docker-stack-caddy.env {{ compose_dir }}/caddy.env --perms 0600
-          && pct exec {{ container_id }} -- test -f {{ compose_dir }}/caddy.env'
-      register: push_caddy_env
-      changed_when: push_caddy_env.rc == 0
-
-    - name: Remove the host-side caddy.env staging copy
-      ansible.builtin.file:
-        path: /tmp/docker-stack-caddy.env
-        state: absent
 
     # --- Phase 4: deploy -----------------------------------------------------
     - name: Bring up the compose stack

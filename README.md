@@ -55,8 +55,10 @@ ansible-playbook ansible/unlock_storage.yaml -e "target_disk=/dev/sdX"
 # Deploy the application stack into the docker LXC. Installs Docker CE in the
 # container (if needed), generates resources/.env -> the container's .env with a
 # strong DB_PASSWORD on first run (never rotated after), pushes the Caddy
-# resources (fails if caddy.env is missing), then `docker compose up -d` (builds
-# the custom Caddy image with the OVH DNS module on first run).
+# resources (fails if caddy.env is missing; the OVH credentials land on the
+# ENCRYPTED volume at secure-storage/secrets/caddy.env, not the container's
+# unencrypted rootfs), then `docker compose up -d` (builds the custom Caddy
+# image with the OVH DNS module on first run).
 # Requires the encrypted storage to be mounted first (run unlock_storage.yaml),
 # else the bind mount captures an empty dir and Postgres inits on the root disk.
 ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml

@@ -119,7 +119,12 @@ services:
     container_name: caddy
     build: ./caddy
     env_file:
-      - caddy.env
+      # OVH DNS-01 credentials — placed on the ENCRYPTED volume by
+      # 05_deploy_docker_stack.yaml (the compose dir sits on the container's
+      # unencrypted rootfs, and this secret is valuable beyond the box).
+      # Absolute path, read by compose at `up` time — which only ever happens
+      # after the LUKS unlock (the deploy/update playbooks guard on it).
+      - /mnt/storage/secrets/caddy.env
     ports:
       - "80:80"
       - "443:443"

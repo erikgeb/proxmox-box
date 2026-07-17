@@ -108,6 +108,24 @@
       changed_when: false
       failed_when: env_check.rc != 0
 
+    # docker-compose.yml references caddy.env at its ENCRYPTED-volume location
+    # (secrets/caddy.env, placed there by 05). A deployment made before that
+    # change still has it on the container rootfs only — `compose up` would
+    # fail mid-play on the missing env_file. Fail fast with the fix instead.
+    - name: Check that caddy.env is on the encrypted volume
+      ansible.builtin.stat:
+        path: "{{ secure_storage_path }}/secrets/caddy.env"
+      register: caddy_env_check
+
+    - name: Fail if caddy.env is not on the encrypted volume yet
+      ansible.builtin.fail:
+        msg: >-
+          {{ secure_storage_path }}/secrets/caddy.env not found. The compose
+          file now reads Caddy's OVH credentials from the encrypted volume —
+          re-run ansible/bootstrap/05_deploy_docker_stack.yaml once (it places
+          the file), then re-run this.
+      when: not caddy_env_check.stat.exists
+
     # --- Pre-bump safety: snapshot + encrypt the Immich DB off-box -----------
     # An Immich version bump can run an IRREVERSIBLE DB migration on first start
     # (e.g. the 2.x -> 3.0 pgvecto.rs -> VectorChord cutover) with no supported
