@@ -9,7 +9,7 @@
 # Where "deployed" comes from (authoritative, read live off the box, not the repo):
 #   * Immich: the IMMICH_VERSION line in the live, generate-once .env (the repo's
 #     .env.example does NOT track it — see update_docker_stack.yaml).
-#   * postgres/valkey/syncthing: the image tags in the deployed docker-compose.yml
+#   * postgres/valkey/syncthing/open-webui: the image tags in the deployed docker-compose.yml
 #     (update_docker_stack.yaml re-pushes that file every upgrade, so box == repo).
 #
 # Where "latest" comes from (fetched live from the box — outbound is fine):
@@ -25,6 +25,7 @@
 #   * caddy: pinned to the floating major `caddy:2` and built locally, so minor
 #     updates arrive on the next `--build`. Latest upstream is shown for awareness;
 #     only a new MAJOR (v3) needs a deliberate tag change.
+#   * open-webui: the latest GitHub release tag from open-webui/open-webui.
 #
 # Comparison is plain string inequality (deployed != latest -> flag it), not
 # ordered semver: the human decides whether to upgrade, this just surfaces drift.
@@ -85,6 +86,7 @@
           postgres: "{{ dep_compose.stdout | regex_search('immich-app/postgres:(\\S+)', '\\1') | first }}"
           valkey: "{{ dep_compose.stdout | regex_search('valkey/valkey:(\\S+)', '\\1') | first }}"
           syncthing: "{{ dep_compose.stdout | regex_search('linuxserver/syncthing:(\\S+)', '\\1') | first }}"
+          open_webui: "{{ dep_compose.stdout | regex_search('open-webui/open-webui:(\\S+)', '\\1') | first }}"
 
     # --- Fetch LATEST versions from upstream (runs on the box) ----------------
     - name: Fetch the latest Immich release
@@ -119,6 +121,14 @@
       register: caddy_release
       changed_when: false
 
+    - name: Fetch the latest Open-WebUI release
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/open-webui/open-webui/releases/latest
+        headers: "{{ gh_headers }}"
+        return_content: yes
+      register: open_webui_release
+      changed_when: false
+
     - name: Resolve the latest versions
       ansible.builtin.set_fact:
         latest:
@@ -127,6 +137,7 @@
           valkey: "{{ immich_upstream_compose.content | regex_search('valkey/valkey:(\\S+)', '\\1') | first }}"
           syncthing: "{{ lsio_images.json.data.repositories.linuxserver | selectattr('name', 'equalto', 'syncthing') | map(attribute='version') | first }}"
           caddy: "{{ caddy_release.json.tag_name }}"
+          open_webui: "{{ open_webui_release.json.tag_name }}"
 
     # --- Compare (string inequality) + report --------------------------------
     - name: Build the drift report
@@ -157,6 +168,11 @@
             latest: "{{ latest.caddy }}"
             drift: false
             note: "minors arrive on next --build; only a new MAJOR needs a tag change"
+          - name: open-webui
+            deployed: "{{ deployed.open_webui }}"
+            latest: "{{ latest.open_webui }}"
+            drift: "{{ deployed.open_webui != latest.open_webui }}"
+            note: "pin exact tag in docker-compose.yml — bump via update_docker_stack.yaml"
 
     # debug prints a LIST with one element per line, so build the table as a
     # list of fixed-width rows (a single folded string would collapse to one line).

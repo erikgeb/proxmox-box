@@ -13,6 +13,8 @@ syncthing_drop_dir: "/mnt/pve/secure-storage/syncthing_share/my-personal-sync/te
 target_disk: "/dev/sda"
 vaultwarden_ip: "192.168.0.77"    # LAN IP of the VaultWarden LXC 101 (repo default 192.168.0.54)
 vaultwarden_ip_suffix: "77"       # last octet 06 assigns at provision time — keep in step with vaultwarden_ip
+llm_ip: "192.168.0.78"            # LAN IP of the Ollama LXC 103 (repo default 192.168.0.56)
+llm_ip_suffix: "78"               # last octet 12 assigns at provision time — keep in step with llm_ip
 # NOTE: do NOT set backups_root here. Inside the playbooks that name is the
 # ON-BOX snapshot root on the encrypted volume (vaultwarden_backups /
 # immich_db_backups); redirecting it into a Syncthing-shared folder would sync

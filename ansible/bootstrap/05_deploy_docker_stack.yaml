@@ -199,6 +199,14 @@
     # docker-compose.yml's env_file points there by absolute path). No pct
     # push needed: the host path IS the container path via the mp0 bind mount,
     # and the phase-1 guard already ensured the encrypted volume is mounted.
+    - name: Ensure the open_webui_data dir exists on the encrypted volume
+      ansible.builtin.file:
+        path: "{{ secure_storage_path }}/open_webui_data"
+        state: directory
+        owner: "100000" # container root under unprivileged id-shift
+        group: "100000"
+        mode: "0775"
+
     - name: Ensure the secrets dir exists on the encrypted volume
       ansible.builtin.file:
         path: "{{ secure_storage_path }}/secrets"
@@ -229,11 +237,12 @@
         msg:
           - "Compose stack deployed in container {{ container_id }} (Caddy image built on first run)."
           - "Via Caddy (HTTPS, once LAN DNS points the names at this LXC):"
-          - "  Immich:    https://immich.<base-domain>"
-          - "  Syncthing: https://syncthing.<base-domain>"
-          - "  Vault:     https://vault.<base-domain>"
-          - "  LLM:       https://llm.<base-domain>"
-          - "Direct (HTTP fallback): http://<container-ip>:2283 (Immich), :8384 (Syncthing)."
+          - "  Immich:     https://immich.<base-domain>"
+          - "  Syncthing:  https://syncthing.<base-domain>"
+          - "  Vault:      https://vault.<base-domain>"
+          - "  LLM:        https://llm.<base-domain>"
+          - "  Open-WebUI: https://ai.<base-domain>"
+          - "Direct (HTTP fallback): http://<container-ip>:2283 (Immich), :8384 (Syncthing), :8080 (Open-WebUI)."
           - "Caddy obtains a *.<base-domain> wildcard cert via OVH DNS-01; check 'docker compose logs caddy' for issuance."
           - "DB password is stored only in {{ compose_dir }}/.env inside the container (generated once, never rotated here)."
 

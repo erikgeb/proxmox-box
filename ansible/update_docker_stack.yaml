@@ -1,11 +1,11 @@
 ---
 # Recurrent maintenance: upgrade the Docker application stack in LXC 100 (Immich
-# + machine-learning, Postgres, Valkey, Syncthing, Caddy). Self-contained, in
+# + machine-learning, Postgres, Valkey, Syncthing, Caddy, Open-WebUI). Self-contained, in
 # ansible/ root like unlock_storage.yaml / update_vaultwarden.yaml.
 #
 # Two upgrade levers, because the version pins live in two places:
 #   * Image tags pinned directly in ansible/resources/docker-compose.yml
-#     (postgres, valkey, syncthing, caddy): edit the tag there, then run this
+#     (postgres, valkey, syncthing, caddy, open-webui): edit the tag there, then run this
 #     playbook — it re-pushes the compose file and pulls.
 #   * Immich: pinned via IMMICH_VERSION, which lives in the generate-once .env.
 #     05_deploy_docker_stack.yaml writes .env exactly once and never rewrites it

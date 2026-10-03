@@ -59,6 +59,12 @@
 		reverse_proxy {{ llm_ip | default('192.168.0.56') }}:11434
 	}
 
+	# Open-WebUI chat interface for the local LLM
+	@ai host ai.{$BASE_DOMAIN}
+	handle @ai {
+		reverse_proxy open-webui:8080
+	}
+
 	handle {
 		respond "Unknown host" 404
 	}

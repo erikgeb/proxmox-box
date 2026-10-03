@@ -45,6 +45,7 @@ This repository contains Ansible playbooks to provision and maintain a hardened,
 - **VaultWarden**: Lightweight, Bitwarden-compatible password vault.
 - **WireGuard**: Secure IPv6-reachable VPN subnet router for remote access.
 - **Ollama**: Local OpenAI-compatible LLM inference server (iGPU accelerated).
+- **Open-WebUI**: User-friendly web interface for non-technical users to interact with local LLMs.
 - **Caddy**: Reverse proxy with automated Let's Encrypt wildcard TLS via DNS-01.
 
 > [!NOTE]
@@ -68,7 +69,7 @@ This repository contains Ansible playbooks to provision and maintain a hardened,
 
 | Container ID | Name | Type / Runtime | Storage Location | Onboot | Trust Zone & Purpose |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **100** | `docker-srv` | Unprivileged LXC + Nesting (`docker compose`) | RootFS on `local-lvm`<br>Data on `/mnt/pve/secure-storage` | `onboot=0` | **Media & Sync Tier**: Immich stack, Syncthing, Caddy reverse proxy. iGPU passthrough (`/dev/dri/renderD128`). |
+| **100** | `docker-srv` | Unprivileged LXC + Nesting (`docker compose`) | RootFS on `local-lvm`<br>Data on `/mnt/pve/secure-storage` | `onboot=0` | **Media, Sync & UI Tier**: Immich stack, Syncthing, Open-WebUI, Caddy reverse proxy. iGPU passthrough (`/dev/dri/renderD128`). |
 | **101** | `vaultwarden` | Unprivileged LXC (Native Binary, No Docker) | RootFS on `local-lvm`<br>Data on `/mnt/pve/secure-storage` | `onboot=0` | **Security / Vault Tier**: Blast-radius isolated password manager. Nesting disabled to enforce maximum LXC confinement. |
 | **102** | `wireguard` | Unprivileged LXC (Native Kernel Module) | Unencrypted RootFS on `local-lvm` | `onboot=1` | **Remote Access Tier**: WireGuard subnet router (`192.168.0.0/24`). Static v4 `192.168.0.55` + SLAAC IPv6 GUA. MASQUERADE return routing. |
 | **103** | `ollama-srv` | Unprivileged LXC (Native Systemd Service) | 150GB RootFS on `local-lvm` | `onboot=1` | **Local Inference Tier**: OpenAI API on `:11434` / `llm.<domain>`. iGPU Vulkan acceleration + P-Core thread binding (`OLLAMA_NUM_THREADS=4`). |
@@ -142,10 +143,10 @@ Execute the following playbooks in order on a fresh Proxmox VE installation.
    cp ansible/resources/caddy.env.example ansible/resources/caddy.env
    # Edit ansible/resources/caddy.env with your BASE_DOMAIN and OVH API credentials
    ```
-   > [!IMPORTANT]
-   > Ensure your LAN DNS (Router, Pi-hole, or hosts file) routes `*.<base-domain>` (e.g., `immich.<domain>`, `syncthing.<domain>`) to LXC 100 IP (`192.168.0.53`).
+    > [!IMPORTANT]
+     > Ensure your LAN DNS (Router, Pi-hole, or hosts file) routes `*.<base-domain>` (e.g., `immich.<domain>`, `syncthing.<domain>`, `ai.<domain>`) to LXC 100 IP (`192.168.0.53`).
 
-4. **Deploy Docker Stack (Immich, Syncthing, Caddy)**:
+4. **Deploy Docker Stack (Immich, Syncthing, Open-WebUI, Caddy)**:
    ```bash
    ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml
    ```
@@ -191,7 +192,7 @@ Execute the following playbooks in order on a fresh Proxmox VE installation.
 
 ---
 
-### Phase 5: Local LLM Inference (Ollama)
+### Phase 5: Local LLM Inference (Ollama & Open-WebUI)
 
 1. **Provision Ollama LXC (ID 103)**:
    ```bash
@@ -205,6 +206,8 @@ Execute the following playbooks in order on a fresh Proxmox VE installation.
    ```bash
    ansible-playbook ansible/manage_llm_model.yaml -e target_model=deepseek-coder-v2:16b
    ```
+4. **Access Web Interface for Non-Technical Users**:
+   Open-WebUI runs as part of the Docker stack (LXC 100) and connects to Ollama on LXC 103. Set LAN DNS for `ai.<base-domain>` to `192.168.0.53` and navigate to `https://ai.<base-domain>` (or `http://192.168.0.53:8080`).
 
 ---
 
@@ -324,7 +327,7 @@ Syncthing uses bind mounts under `/mnt/storage/syncthing_share` (`/data` inside 
 
 ### Host & Guest OS Updates
 
-Applies `apt update && apt dist-upgrade` across Proxmox host and LXCs 100, 101, and 102. Does not reboot host.
+Applies `apt update && apt dist-upgrade` across Proxmox host and LXCs 100, 101, 102, and 103. Does not reboot host.
 ```bash
 ansible-playbook ansible/update_proxmox.yaml
 ```
@@ -337,7 +340,7 @@ ansible-playbook ansible/update_proxmox.yaml
    ```
 2. **Upgrade Docker Application Stack**:
    ```bash
-   # Upgrade base compose stack (Syncthing, Caddy, Postgres, Valkey)
+   # Upgrade base compose stack (Syncthing, Open-WebUI, Caddy, Postgres, Valkey)
    ansible-playbook ansible/update_docker_stack.yaml
 
    # Upgrade Immich version with auto DB backup

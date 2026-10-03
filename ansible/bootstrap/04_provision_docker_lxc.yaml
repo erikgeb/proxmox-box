@@ -49,6 +49,7 @@
       - immich_db
       - syncthing_data
       - caddy_data
+      - open_webui_data
     # syncthing_share holds user-synced DATA (bind-mounted to /data in the
     # container), unlike syncthing_data (/config). The linuxserver/syncthing
     # service runs as uid/gid 911 (PUID/PGID, pinned in docker-compose.yml) and

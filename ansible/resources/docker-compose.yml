@@ -109,6 +109,21 @@ services:
       - "22000:22000/tcp"
     restart: always
 
+  # User-friendly Web UI for local LLM inference (Ollama in LXC 103).
+  # Data (user accounts, chats, settings) persists on the LUKS volume.
+  open-webui:
+    <<: *default-logging
+    container_name: open_webui
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    environment:
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://192.168.0.56:11434}
+      - WEBUI_AUTH=true
+    volumes:
+      - /mnt/storage/open_webui_data:/app/backend/data
+    ports:
+      - "8080:8080"
+    restart: always
+
   # Reverse proxy + in-home HTTPS. Terminates TLS for the LAN with a Let's
   # Encrypt wildcard cert obtained via ACME DNS-01 (OVH) and auto-renewed.
   # Built from ./caddy/Dockerfile because the stock image has no DNS plugins.
