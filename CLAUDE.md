@@ -55,6 +55,7 @@ ansible-playbook ansible/bootstrap/05_deploy_docker_stack.yaml                  
 ansible-playbook ansible/bootstrap/06_provision_vaultwarden_lxc.yaml                  # creates the isolated VaultWarden LXC (id 101) via pct (requires storage mounted)
 ansible-playbook ansible/bootstrap/07_deploy_vaultwarden.yaml                         # installs VaultWarden as a native binary in 101 (requires storage mounted + containers 100 & 101)
 ansible-playbook ansible/bootstrap/08_enable_unattended_upgrades.yaml                 # one-time: Debian SECURITY-only unattended-upgrades on the host (no auto-reboot)
+ansible-playbook ansible/bootstrap/14_setup_cert_auto_update.yaml                 # host systemd path watcher: auto-sync Caddy wildcard cert to pveproxy on renewal
 ansible-playbook ansible/bootstrap/11_encrypt_swap.yaml                               # one-time: encrypt host swap with an ephemeral per-boot key (idempotent, no reboot; -e swap_device= if not /dev/pve/swap)
 ansible-playbook ansible/unlock_storage.yaml -e "target_disk=/dev/sdX"   # post-reboot: unlock LUKS + start the existing/stopped dependent containers
 

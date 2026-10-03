@@ -1,0 +1,134 @@
+---
+# Host setup: automatically sync Caddy's renewed wildcard certificate to the Proxmox
+# web UI (pveproxy) whenever Caddy (in LXC 100) auto-renews it.
+#
+# How it works: Caddy auto-renews certificates and writes them to the encrypted
+# volume at /mnt/pve/secure-storage/caddy_data/caddy/certificates/. This playbook
+# installs a host script (/usr/local/bin/sync-proxmox-cert.sh) and a systemd path
+# unit (proxmox-cert-sync.path) that monitors that directory for changes (PathChanged).
+#
+# When Caddy writes a new certificate, the path unit triggers proxmox-cert-sync.service.
+# The service checks if /mnt/pve/secure-storage is mounted, compares SHA-256 fingerprints
+# between Caddy's certificate and pveproxy's current certificate (/etc/pve/local/pveproxy-ssl.pem),
+# and calls `pvenode cert set --force --restart` only when a fingerprint change is detected.
+#
+# Unmounted / LUKS-locked handling:
+#   - Caddy runs in LXC 100 on the encrypted volume, so Caddy only runs/renews when mounted.
+#   - Both systemd (ConditionPathIsMountPoint=/mnt/pve/secure-storage) and the script
+#     (mountpoint -q) guard against running when the storage is unmounted.
+#
+# Usage:
+#   ansible-playbook ansible/bootstrap/14_setup_cert_auto_update.yaml
+- name: Set up automatic Proxmox certificate sync on Caddy renewal
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    sync_script_path: /usr/local/bin/sync-proxmox-cert.sh
+    service_unit_path: /etc/systemd/system/proxmox-cert-sync.service
+    path_unit_path: /etc/systemd/system/proxmox-cert-sync.path
+
+  tasks:
+    - name: Install certificate sync script
+      ansible.builtin.copy:
+        dest: "{{ sync_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          MOUNT_POINT="/mnt/pve/secure-storage"
+          CADDY_DIR="${MOUNT_POINT}/caddy_data/caddy/certificates"
+          PVE_CERT="/etc/pve/local/pveproxy-ssl.pem"
+
+          # Guard: Storage must be mounted
+          if ! mountpoint -q "$MOUNT_POINT"; then
+              echo "Storage $MOUNT_POINT is not mounted. Skipping certificate sync."
+              exit 0
+          fi
+
+          if [[ ! -d "$CADDY_DIR" ]]; then
+              echo "Caddy certificates directory $CADDY_DIR does not exist. Skipping."
+              exit 0
+          fi
+
+          # Find production wildcard certificate (or staging fallback)
+          CERT=$(find "$CADDY_DIR" -type f -name "wildcard_*.crt" 2>/dev/null | grep -v "acme-staging" | head -n 1 || true)
+          if [[ -z "$CERT" ]]; then
+              CERT=$(find "$CADDY_DIR" -type f -name "wildcard_*.crt" 2>/dev/null | head -n 1 || true)
+          fi
+
+          if [[ -z "$CERT" || ! -f "$CERT" ]]; then
+              echo "No Caddy wildcard certificate found under $CADDY_DIR. Skipping."
+              exit 0
+          fi
+
+          KEY="${CERT%.crt}.key"
+          if [[ ! -f "$KEY" ]]; then
+              echo "Key file $KEY missing for cert $CERT. Skipping."
+              exit 0
+          fi
+
+          # Compare SHA-256 fingerprints
+          SRC_FP=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null || true)
+          CUR_FP=$(openssl x509 -in "$PVE_CERT" -noout -fingerprint -sha256 2>/dev/null || true)
+
+          if [[ "$SRC_FP" != "$CUR_FP" ]]; then
+              echo "Certificate update required. Applying to pveproxy..."
+              pvenode cert set "$CERT" "$KEY" --force --restart
+              echo "pveproxy certificate updated successfully."
+          else
+              echo "Proxmox certificate is already up-to-date."
+          fi
+
+    - name: Install systemd service unit
+      ansible.builtin.copy:
+        dest: "{{ service_unit_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Sync Caddy Wildcard TLS Certificate to Proxmox pveproxy
+          ConditionPathIsMountPoint=/mnt/pve/secure-storage
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ sync_script_path }}
+
+    - name: Install systemd path unit
+      ansible.builtin.copy:
+        dest: "{{ path_unit_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Watch Caddy certificate renewals on encrypted volume
+
+          [Path]
+          PathChanged=/mnt/pve/secure-storage/caddy_data/caddy/certificates
+          Unit=proxmox-cert-sync.service
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start systemd path unit
+      ansible.builtin.systemd:
+        name: proxmox-cert-sync.path
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Automatic Proxmox certificate sync enabled via systemd path unit."
+          - "Path unit: systemctl status proxmox-cert-sync.path"
+          - "Service unit: systemctl status proxmox-cert-sync.service"
+          - "Manual run on host: {{ sync_script_path }}"
+          - "Manual fallback playbook: ansible-playbook ansible/update_proxmox_cert.yaml"

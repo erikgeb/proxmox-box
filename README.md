@@ -208,12 +208,18 @@ Execute the following playbooks in order on a fresh Proxmox VE installation.
 
 ---
 
-### Phase 6: Automatic Security Patching
+### Phase 6: Automatic Security Patching & Maintenance
 
 1. **Enable Security Unattended Upgrades**:
    ```bash
    ansible-playbook ansible/bootstrap/08_enable_unattended_upgrades.yaml
    ```
+
+2. **Enable Proxmox Web UI Certificate Auto-Sync**:
+   ```bash
+   ansible-playbook ansible/bootstrap/14_setup_cert_auto_update.yaml
+   ```
+   *(Note: If auto-sync is ever delayed or disabled, you can always manually trigger a sync from your workstation using `ansible-playbook ansible/update_proxmox_cert.yaml`.)*
 
 ---
 
