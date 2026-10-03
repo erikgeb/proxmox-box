@@ -231,6 +231,9 @@
           - "Via Caddy (HTTPS, once LAN DNS points the names at this LXC):"
           - "  Immich:    https://immich.<base-domain>"
           - "  Syncthing: https://syncthing.<base-domain>"
+          - "  Vault:     https://vault.<base-domain>"
+          - "  LLM:       https://llm.<base-domain>"
           - "Direct (HTTP fallback): http://<container-ip>:2283 (Immich), :8384 (Syncthing)."
           - "Caddy obtains a *.<base-domain> wildcard cert via OVH DNS-01; check 'docker compose logs caddy' for issuance."
           - "DB password is stored only in {{ compose_dir }}/.env inside the container (generated once, never rotated here)."
+

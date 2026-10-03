@@ -1,0 +1,100 @@
+---
+# Recurrent maintenance: upgrade the Ollama binary inside LXC 103 to the latest upstream release.
+# Self-contained, in ansible/ root like update_vaultwarden.yaml / update_docker_stack.yaml.
+#
+# Reads the currently installed version live off the box, compares it against the latest
+# GitHub release from ollama/ollama, updates via Ollama's official installer, re-applies
+# systemd P-core thread tuning, and health-checks the service.
+#
+# Model files (/var/lib/ollama) are completely untouched.
+#
+# Usage:
+#   ansible-playbook ansible/update_llm.yaml
+#   ansible-playbook ansible/update_llm.yaml -e force_update=true
+- name: Update Ollama LLM Service inside LXC 103
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    container_id: "{{ llm_container_id | default(103) }}"
+    num_threads: "{{ llm_num_threads | default(4) }}"
+    enable_igpu: "{{ llm_enable_igpu | default(false) }}"
+    force: "{{ force_update | default(false) }}"
+
+  tasks:
+    # --- Phase 1: Guards & Container Readiness -------------------------------
+    - name: Check the Ollama LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Ollama LXC does not exist or is stopped
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} is not running. Run 12_provision_llm_lxc.yaml / 13_deploy_llm.yaml first."
+      when: "'status: running' not in ct_status.stdout"
+
+    # --- Phase 2: Probe Installed & Upstream Versions ------------------------
+    - name: Probe currently installed Ollama version inside LXC
+      ansible.builtin.command: "pct exec {{ container_id }} -- ollama --version"
+      register: installed_ver_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Extract installed version string
+      ansible.builtin.set_fact:
+        installed_version: "{{ installed_ver_probe.stdout | regex_search('v?[0-9]+\\.[0-9]+\\.[0-9]+') | default('none') }}"
+
+    - name: Fetch latest release version from GitHub API
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/ollama/ollama/releases/latest"
+        return_content: yes
+      delegate_to: localhost
+      become: no
+      register: latest_release_response
+      failed_when: false
+
+    - name: Extract latest upstream version tag
+      ansible.builtin.set_fact:
+        latest_version: "{{ (latest_release_response.json.tag_name | default('')) if (latest_release_response.status == 200) else 'unknown' }}"
+
+    - name: Display version comparison
+      ansible.builtin.debug:
+        msg: "Installed Ollama version: '{{ installed_version }}' | Latest upstream release: '{{ latest_version }}'"
+
+    # --- Phase 3: Upgrade Binary (if outdated or forced) --------------------
+    - name: Upgrade Ollama via official installer
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -c 'curl -fsSL https://ollama.com/install.sh | sh'"
+      when: force | bool or (latest_version != 'unknown' and installed_version != latest_version) or installed_version == 'none'
+      register: upgrade_result
+
+    # --- Phase 4: Re-apply Systemd Override & Restart ------------------------
+    - name: Re-apply Systemd Service Override for Ollama
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          mkdir -p /etc/systemd/system/ollama.service.d;
+          printf "[Service]\nEnvironment=\"OLLAMA_HOST=0.0.0.0:11434\"\nEnvironment=\"OLLAMA_NUM_THREADS={{ num_threads }}\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=30m\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\n{% if enable_igpu | bool %}Environment=\"OLLAMA_IGPU_ENABLE=1\"\n{% endif %}" > /etc/systemd/system/ollama.service.d/override.conf;
+          systemctl daemon-reload;
+          systemctl restart ollama;
+          '
+      when: upgrade_result is changed
+
+    # --- Phase 5: Health Verification ----------------------------------------
+    - name: Verify Ollama API health endpoint after upgrade
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- curl -sS http://127.0.0.1:11434/api/tags"
+      register: api_check
+      changed_when: false
+      when: upgrade_result is changed
+
+    - name: Report Upgrade Result
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'Ollama successfully upgraded to ' + latest_version + ' inside LXC ' + container_id | string if (upgrade_result is changed)
+            else 'Ollama is already on the latest version (' + installed_version + '). No upgrade needed.'
+          }}

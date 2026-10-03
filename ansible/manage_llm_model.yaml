@@ -1,0 +1,54 @@
+---
+- name: Manage Local LLM Models (Ollama)
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    container_id: "{{ llm_container_id | default(103) }}"
+    model_action: "{{ action | default('pull') }}"  # pull, rm, list, show
+    model_name: "{{ target_model | default('deepseek-coder-v2:16b') }}"
+
+  tasks:
+    - name: Check whether the Ollama LXC container exists and is running
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if container is missing or stopped
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} is not running. Run 12_provision_llm_lxc.yaml / 13_deploy_llm.yaml first."
+      when: "'status: running' not in ct_status.stdout"
+
+    - name: List installed Ollama models
+      ansible.builtin.command: "pct exec {{ container_id }} -- ollama list"
+      register: ollama_list_out
+      when: model_action == 'list'
+
+    - name: Display installed models
+      ansible.builtin.debug:
+        msg: "{{ ollama_list_out.stdout_lines }}"
+      when: model_action == 'list'
+
+    - name: Show model details
+      ansible.builtin.command: "pct exec {{ container_id }} -- ollama show {{ model_name }}"
+      register: ollama_show_out
+      when: model_action == 'show'
+
+    - name: Display model details
+      ansible.builtin.debug:
+        msg: "{{ ollama_show_out.stdout_lines }}"
+      when: model_action == 'show'
+
+    - name: Pull model ({{ model_name }})
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- ollama pull {{ model_name }}"
+      when: model_action == 'pull'
+
+    - name: Remove model ({{ model_name }})
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- ollama rm {{ model_name }}"
+      when: model_action == 'rm'
+

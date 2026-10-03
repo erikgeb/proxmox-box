@@ -187,7 +187,43 @@ ansible-playbook ansible/add_wireguard_peer.yaml -e peer_name=phone -e wg_endpoi
 # Revoke a device (e.g. lost phone): strips its peer block and drops it live.
 ansible-playbook ansible/remove_wireguard_peer.yaml -e peer_name=phone
 
+# Local LLM Server (Ollama in LXC 103) — OpenAI-compatible API for coding agents
+#
+# Dedicated unprivileged LXC container (id 103) running Ollama to serve local
+# Large Language Models (LLMs) optimized for coding tasks via an OpenAI-compatible
+# API endpoint at https://llm.<base-domain>/v1 or http://192.168.0.56:11434.
+#
+# Hardware & Architecture:
+#   - RootFS on local-lvm (unencrypted 150GB thinpool, onboot=1): public model weights
+#     carry zero private data, so the LLM server autostarts on boot without LUKS unlock.
+#   - P-Core Thread Binding: OLLAMA_NUM_THREADS=4 (parameterized as llm_num_threads)
+#     binds matrix math solvers strictly to P-core threads, preventing barrier
+#     synchronization slowdowns from E-cores while leaving E-cores free for system
+#     background tasks.
+#   - iGPU Acceleration: Passes through /dev/dri/renderD128 (gated via stat probe)
+#     to accelerate prompt evaluation (prefill t/s) via Mesa Vulkan drivers.
+#   - RAM Allocation: 28 GB allocated to LXC 103 with OLLAMA_KEEP_ALIVE=30m auto-unload
+#     so heavy models (e.g. Mixtral 8x7B MoE ~26GB, Qwen2.5 57B MoE ~24GB, Qwen2.5-Coder 32B ~20GB)
+#     can run when needed and free system memory when idle.
+
+# Provision LXC 103 (ollama-srv):
+ansible-playbook ansible/bootstrap/12_provision_llm_lxc.yaml
+
+# Deploy Ollama, Vulkan drivers, systemd P-core tuning, and initial default model (deepseek-coder-v2:16b):
+ansible-playbook ansible/bootstrap/13_deploy_llm.yaml
+
+# Recurrent: check & upgrade Ollama binary to the latest upstream release (GitHub releases):
+ansible-playbook ansible/update_llm.yaml
+
+# Manage models (pull, remove, list, inspect):
+
+ansible-playbook ansible/manage_llm_model.yaml -e target_model=deepseek-coder-v2:16b  # fast MoE default
+ansible-playbook ansible/manage_llm_model.yaml -e target_model=mixtral:8x7b           # high reasoning 26GB MoE
+ansible-playbook ansible/manage_llm_model.yaml -e target_model=qwen2.5-coder:32b       # dense 32B model
+ansible-playbook ansible/manage_llm_model.yaml -e model_action=list                   # list installed models
+
 # Backups
+
 #
 # LUKS only protects against disk theft — NOT deletion, corruption, or a bad
 # migration on the live, unlocked box. Backup strategy:

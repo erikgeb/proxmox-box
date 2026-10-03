@@ -52,7 +52,15 @@
 		reverse_proxy {{ vaultwarden_ip | default('192.168.0.54') }}:8000
 	}
 
+	# Ollama local LLM service runs in LXC 103 (ollama-srv). Exposes OpenAI-compatible
+	# API endpoint at /v1. Reached by static IP.
+	@llm host llm.{$BASE_DOMAIN}
+	handle @llm {
+		reverse_proxy {{ llm_ip | default('192.168.0.56') }}:11434
+	}
+
 	handle {
 		respond "Unknown host" 404
 	}
 }
+

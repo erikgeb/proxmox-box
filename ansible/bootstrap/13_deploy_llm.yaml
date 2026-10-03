@@ -1,0 +1,87 @@
+---
+- name: Deploy Ollama LLM Service inside LXC 103
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    container_id: "{{ llm_container_id | default(103) }}"
+    default_model: "{{ llm_default_model | default('deepseek-coder-v2:16b') }}"
+    num_threads: "{{ llm_num_threads | default(4) }}"
+    enable_igpu: "{{ llm_enable_igpu | default(false) }}"
+
+  tasks:
+    # --- Phase 1: Guards & Container Readiness -------------------------------
+    - name: Check the Ollama LXC status
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Ollama LXC does not exist
+      ansible.builtin.fail:
+        msg: "Container {{ container_id }} does not exist. Run 12_provision_llm_lxc.yaml first."
+      when: "'does not exist' in ct_status.stderr or ct_status.rc != 0"
+
+    - name: Start the Ollama LXC if it is not already running
+      ansible.builtin.command: "pct start {{ container_id }}"
+      when: "'status: running' not in ct_status.stdout"
+      register: ct_start
+      changed_when: ct_start.rc == 0
+
+    # --- Phase 2: Drivers & Packages inside LXC -----------------------------
+    - name: Install dependencies and Vulkan/OpenCL drivers inside LXC
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          set -euo pipefail;
+          export DEBIAN_FRONTEND=noninteractive;
+          apt-get update;
+          apt-get install -y curl ca-certificates zstd mesa-vulkan-drivers vulkan-tools clinfo intel-media-va-driver;
+          '
+
+    # --- Phase 3: Install Ollama Engine --------------------------------------
+    - name: Check whether Ollama is already installed inside LXC
+      ansible.builtin.command: "pct exec {{ container_id }} -- command -v ollama"
+      register: ollama_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Install Ollama binary inside LXC
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- bash -c 'curl -fsSL https://ollama.com/install.sh | sh'"
+      when: ollama_probe.rc != 0
+
+    # --- Phase 4: Configure Systemd Environment & Thread Binding ------------
+    - name: Configure Systemd Service Override for Ollama
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ container_id }} -- bash -c '
+          mkdir -p /etc/systemd/system/ollama.service.d;
+          printf "[Service]\nEnvironment=\"OLLAMA_HOST=0.0.0.0:11434\"\nEnvironment=\"OLLAMA_NUM_THREADS={{ num_threads }}\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=30m\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\n{% if enable_igpu | bool %}Environment=\"OLLAMA_IGPU_ENABLE=1\"\n{% endif %}" > /etc/systemd/system/ollama.service.d/override.conf;
+          systemctl daemon-reload;
+          systemctl restart ollama;
+          '
+
+    # --- Phase 5: Initial Model Download -------------------------------------
+    - name: Check which models are currently downloaded
+      ansible.builtin.command: "pct exec {{ container_id }} -- ollama list"
+      register: ollama_list
+      changed_when: false
+
+    - name: Pull the default model ({{ default_model }})
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- ollama pull {{ default_model }}"
+      when: default_model not in ollama_list.stdout
+
+    # --- Phase 6: Health Verification ----------------------------------------
+    - name: Verify Ollama API health endpoint
+      ansible.builtin.command:
+        cmd: "pct exec {{ container_id }} -- curl -sS http://127.0.0.1:11434/api/tags"
+      register: api_check
+      changed_when: false
+
+    - name: Report Deployment Success
+      ansible.builtin.debug:
+        msg: "Ollama deployed successfully inside LXC {{ container_id }}. Listening on port 11434 with OLLAMA_NUM_THREADS={{ num_threads }} (iGPU enabled: {{ enable_igpu }}). Default model: {{ default_model }}."

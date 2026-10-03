@@ -1,0 +1,107 @@
+---
+- name: Provision the Ollama LLM LXC Container
+  hosts: proxmox
+  gather_facts: no
+  remote_user: ansible-worker
+  become: yes
+
+  vars:
+    # Dedicated container ID for the Ollama local LLM service (LXC 103).
+    # Unprivileged, no nesting, rootfs on local-lvm (unencrypted, onboot=1 so it
+    # autostarts without waiting for manual LUKS unlock — public model weights carry
+    # zero private data).
+    container_id: "{{ llm_container_id | default(103) }}"
+    hostname: ollama-srv
+    ostemplate_series: debian-13-standard
+    ostemplate: "local:vztmpl/{{ ostemplate_name }}"
+    rootfs_storage: local-lvm
+    rootfs_size: "{{ llm_rootfs_size_gb | default(150) }}"
+    cores: "{{ llm_cores | default(6) }}"
+    memory: "{{ llm_memory_mb | default(28672) }}"
+    swap: 2048
+    network_bridge: vmbr0
+    network_prefix: "192.168.0"
+    docker_host_ip_suffix: "{{ llm_ip_suffix | default('56') }}"
+    gpu_device: "{{ llm_gpu_device | default('/dev/dri/renderD128') }}"
+
+  tasks:
+    # pct create needs the OS template present in `local` storage first.
+    - name: Refresh the appliance template catalog
+      ansible.builtin.command: pveam update
+      changed_when: false
+      failed_when: false
+
+    - name: Check which OS templates are already downloaded
+      ansible.builtin.command: "pveam list local"
+      register: pveam_list
+      changed_when: false
+
+    - name: Resolve the OS template (newest local {{ ostemplate_series }}, else newest in catalog)
+      ansible.builtin.shell: |
+        set -o pipefail
+        tmpl=$(pveam list local | awk '{print $1}' | sed 's|.*/||' | grep "^{{ ostemplate_series }}_" | sort -V | tail -n 1)
+        if [ -z "$tmpl" ]; then
+          tmpl=$(pveam available --section system | awk '{print $2}' | grep "^{{ ostemplate_series }}_" | sort -V | tail -n 1)
+        fi
+        if [ -z "$tmpl" ]; then
+          echo "no {{ ostemplate_series }} template found locally or in the pveam catalog" >&2
+          exit 1
+        fi
+        echo "$tmpl"
+      args:
+        executable: /bin/bash
+      register: tmpl_resolve
+      changed_when: false
+
+    - name: Pin the resolved template name for this run
+      ansible.builtin.set_fact:
+        ostemplate_name: "{{ tmpl_resolve.stdout | trim }}"
+
+    - name: Download the Debian OS template
+      ansible.builtin.command: "pveam download local {{ ostemplate_name }}"
+      when: ostemplate_name not in pveam_list.stdout
+      register: tmpl_download
+      changed_when: tmpl_download.rc == 0
+
+    - name: Check whether the container already exists
+      ansible.builtin.command: "pct status {{ container_id }}"
+      register: ct_status
+      changed_when: false
+      failed_when: false
+
+    - name: Create the Ollama LLM LXC container
+      ansible.builtin.command:
+        cmd: >-
+          pct create {{ container_id }} {{ ostemplate }}
+          --hostname {{ hostname }}
+          --cores {{ cores }}
+          --memory {{ memory }}
+          --swap {{ swap }}
+          --unprivileged 1
+          --onboot 1
+          --rootfs {{ rootfs_storage }}:{{ rootfs_size }}
+          --net0 name=eth0,bridge={{ network_bridge }},ip={{ network_prefix }}.{{ docker_host_ip_suffix }}/24,gw={{ network_prefix }}.1
+      when: ct_status.rc != 0
+      register: ct_create
+      changed_when: ct_create.rc == 0
+
+    - name: Check whether the GPU render device is present on the host
+      ansible.builtin.stat:
+        path: "{{ gpu_device }}"
+      register: gpu_stat
+
+    - name: Ensure GPU device passthrough is configured
+      ansible.builtin.command:
+        cmd: "pct set {{ container_id }} --dev0 {{ gpu_device }},uid=1000,gid=1000,mode=0666"
+      when: gpu_stat.stat.exists
+      register: ct_dev
+      changed_when: ct_dev.rc == 0
+
+    - name: Warn if GPU device is absent (falling back to CPU inference)
+      ansible.builtin.debug:
+        msg: "{{ gpu_device }} not found on host — skipping GPU passthrough. Ollama inference will run on CPU."
+      when: not gpu_stat.stat.exists
+
+    - name: Display provisioning result
+      ansible.builtin.debug:
+        msg: "Container {{ container_id }} ({{ hostname }}) provisioned (IP: {{ network_prefix }}.{{ docker_host_ip_suffix }}, RAM: {{ memory }}MB, RootFS: {{ rootfs_size }}GB, onboot=1). Deploy Ollama with 13_deploy_llm.yaml."
